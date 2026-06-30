@@ -88,8 +88,184 @@ def _resolve_bridge_network(
     return "host.docker.internal", f"http://localhost:{sandbox_port}"
 
 
+# Marker prefixing every simulated-user message — identical to the native loop
+# (runner/loop.py) and the AO arm. The user_agent_clarify grader splits the
+# clarify vs answer phases on this prefix, and UserAgent._format_transcript
+# strips it when showing the persona model the conversation.
+_USER_AGENT_MARKER = "[user_agent]"
 
-# OpenClaw 2026.6.x built-in tools that we don't want the LLM to use during a
+
+def _turn_final_text(raw: "dict") -> str:
+    """Extract the agent's final answer text from one run_in_container result.
+
+    ``run_in_container`` returns ``{"trace": {"lastText": ..., "executionTrace":
+    [...]}}``. ``lastText`` is the preferred source, BUT container ``--json``
+    output is shaped ``{payloads, meta}`` — none of the keys run_in_container
+    probes for lastText (textOutputs/reply/text) — so lastText is frequently the
+    empty string even when the executionTrace holds the real answer. Treating an
+    empty lastText as the final text made the UserAgent see an empty turn and
+    immediately return [DONE], collapsing multi-turn to a single turn. So we
+    fall back to the LAST assistant text event in the executionTrace, mirroring
+    what the trace itself shows.
+    """
+    if not isinstance(raw, dict):
+        return ""
+    trace = raw.get("trace") if isinstance(raw.get("trace"), dict) else {}
+    last_text = trace.get("lastText")
+    if isinstance(last_text, str) and last_text.strip():
+        return last_text
+    top = raw.get("lastText")
+    if isinstance(top, str) and top.strip():
+        return top
+    # Fall back to the final assistant text event in the executionTrace.
+    events = trace.get("executionTrace")
+    if isinstance(events, list):
+        for event in reversed(events):
+            if (
+                isinstance(event, dict)
+                and event.get("type") == "text"
+                and event.get("role") == "assistant"
+                and isinstance(event.get("content"), str)
+            ):
+                return event["content"]
+    return ""
+
+
+def _rebuild_conversation(turns: "list[dict]", injected: "list[str]") -> "list":
+    """Reconstruct a ``list[Message]`` for ``UserAgent.generate_response``.
+
+    The native loop hands the UserAgent the full running ``messages`` list; the
+    OpenClaw arm runs each turn as an independent CLI process, so we rebuild the
+    transcript from the per-turn final answers and the user replies injected so
+    far. The UserAgent only consumes ``Message.text`` (via _format_transcript),
+    so a text-only reconstruction is sufficient:
+
+    * each turn's final answer becomes an ``assistant`` message;
+    * each injected reply becomes a ``[user_agent]``-prefixed ``user`` message,
+      interleaved AFTER its triggering assistant answer.
+    """
+    from ..models.content import TextBlock
+    from ..models.message import Message
+
+    msgs: list = []
+    for idx, raw in enumerate(turns):
+        answer = _turn_final_text(raw)
+        if answer:
+            msgs.append(Message(role="assistant", content=[TextBlock(text=answer)]))
+        if idx < len(injected):
+            reply = injected[idx]
+            msgs.append(
+                Message(
+                    role="user",
+                    content=[TextBlock(text=f"{_USER_AGENT_MARKER}\n{reply}")],
+                )
+            )
+    return msgs
+
+
+def _merge_turn_traces(turns: "list[dict]", injected: "list[str]") -> "list[dict]":
+    """Concatenate per-turn OpenClaw executionTraces into one stream.
+
+    OpenClaw records the injected ``--message`` (which we already prefix with
+    ``[user_agent]``) as the FIRST user event of the NEXT turn's executionTrace.
+    So we must NOT re-insert our own ``[user_agent]`` sentinel — the marker is
+    already carried by OpenClaw's own trace, and re-inserting it would duplicate
+    both the marker and its surrounding context. We therefore plain-concatenate
+    each turn's executionTrace; the ``[user_agent]`` markers appear exactly once
+    (from OpenClaw), which is what the user_agent_clarify grader splits on.
+
+    ``injected`` is accepted for signature stability / future validation but is
+    not spliced in (see above). Single-turn is a pure pass-through.
+    """
+    merged: list[dict] = []
+    for raw in turns:
+        trace = raw.get("trace") if isinstance(raw, dict) else None
+        events = trace.get("executionTrace") if isinstance(trace, dict) else None
+        if isinstance(events, list):
+            merged.extend(e for e in events if isinstance(e, dict))
+    return merged
+
+
+def _drive_user_agent_turns(
+    *,
+    prompt: str,
+    run_turn,
+    user_agent: "UserAgent | None",
+    persona: str,
+    max_rounds: int,
+    agent_id: str,
+    run_id: str,
+) -> "dict":
+    """Drive the simulated-user multi-turn loop for the OpenClaw arm.
+
+    ``run_turn(message, session_key) -> raw`` runs one in-container
+    ``openclaw agent`` call (the caller binds it to ``run_in_container`` with
+    all the container/provider/bridge context). This function owns ONLY the
+    turn-taking control flow, so it is unit-testable with a stub ``run_turn``.
+
+    Contract (mirrors native loop / AO arm):
+
+    * Turn 1 sends the task ``prompt``.
+    * After each turn, if a ``user_agent`` is present and we are under
+      ``max_rounds``, the simulated user reacts to the agent's answer. A
+      ``None`` reply means ``[DONE]`` (satisfied) — the loop ends, the prior
+      answer is final. A non-None reply is sent as the next turn's message,
+      ``[user_agent]``-prefixed.
+    * Every turn reuses the SAME ``session_key`` so OpenClaw's persisted
+      session accumulates the conversation across the independent CLI calls.
+      The key embeds ``run_id`` for per-run uniqueness.
+    * ``user_agent is None`` ⇒ exactly one turn, no session_key (single-turn
+      behaviour is byte-identical to the pre-multi-turn path).
+
+    Returns ``{"turns": [raw, ...], "rounds": n, "done": bool,
+    "session_key": str | None}``.
+    """
+    if user_agent is None:
+        raw = run_turn(prompt, None)
+        return {
+            "turns": [raw],
+            "injected": [],
+            "rounds": 0,
+            "done": False,
+            "session_key": None,
+        }
+
+    session_key = f"agent:{agent_id}:claweval-{run_id}"
+    turns: list = []
+    injected: list[str] = []
+    rounds = 0
+    done = False
+
+    message = prompt
+    while True:
+        raw = run_turn(message, session_key)
+        turns.append(raw)
+
+        if rounds >= max_rounds:
+            break
+
+        transcript = _rebuild_conversation(turns, injected)
+        reply = user_agent.generate_response(
+            persona=persona, conversation_messages=transcript
+        )
+        if reply is None:  # [DONE] — user satisfied
+            done = True
+            break
+
+        rounds += 1
+        injected.append(reply)
+        message = f"{_USER_AGENT_MARKER}\n{reply}"
+
+    return {
+        "turns": turns,
+        "injected": injected,
+        "rounds": rounds,
+        "done": done,
+        "session_key": session_key,
+    }
+
+
+
 # claw-eval task — they let the model bypass the bridge plugin (which is the
 # whole point of evaluating tool use). Derived empirically from the
 # ``[agents/tool-policy]`` diagnostic that fires when ``tools.profile`` is set,
@@ -140,13 +316,16 @@ class OpenClawHarness:
       declaring ``Bash`` etc are rejected by preflight in this mode.
 
     ``supported_features`` includes ``sandbox_tools`` because the container
-    mode bridges them to the sandbox server. ``user_agent`` and ``compact``
-    are still omitted — they rely on claw-eval loop-internal hooks that
-    don't translate to the OpenClaw one-shot model.
+    mode bridges them to the sandbox server. ``user_agent`` is supported in
+    container mode via the multi-turn driver loop (each ``openclaw agent`` call
+    is one turn; consecutive turns reuse the same ``--session-key`` so
+    OpenClaw's persisted session carries the conversation). ``compact`` is still
+    omitted — it relies on a claw-eval loop-internal hook that doesn't translate
+    to the OpenClaw model.
     """
 
     name = "openclaw"
-    supported_features = frozenset({"http_services", "sandbox_tools"})
+    supported_features = frozenset({"http_services", "sandbox_tools", "user_agent"})
 
     # ------------------------------------------------------------------
     # Preflight
@@ -155,10 +334,13 @@ class OpenClawHarness:
     def preflight(self, task: "TaskDefinition") -> list[str]:
         """Reject tasks whose semantics OpenClaw can't honour.
 
-        Strict rejections (all modes):
-
-        - ``user_agent.enabled``: OpenClaw is a one-shot CLI; it can't accept
-          mid-run injected user replies.
+        ``user_agent.enabled`` is now ACCEPTED: the container path drives the
+        simulated-user multi-turn loop itself (each ``openclaw agent`` call is
+        one turn, consecutive turns reuse the same ``--session-key`` so
+        OpenClaw's persisted session accumulates the conversation). The
+        host-smoke path (non-production) does not run the loop and simply
+        executes the first turn — acceptable because host smoke is not a
+        scoring path.
 
         Soft rejections (handled by container mode, not host smoke):
 
@@ -172,11 +354,7 @@ class OpenClawHarness:
           (§3.4a) translates them into native OpenClaw tools that fetch the
           mock services directly.
         """
-        errs: list[str] = []
-        ua = getattr(task, "user_agent", None)
-        if ua is not None and getattr(ua, "enabled", False):
-            errs.append("openclaw harness does not support simulated user_agent")
-        return errs
+        return []
 
     # ------------------------------------------------------------------
     # Run — dispatcher
@@ -207,6 +385,7 @@ class OpenClawHarness:
                 run_id=run_id,
                 cfg=cfg,
                 sandbox_handle=sandbox_handle,
+                user_agent=user_agent,
                 services_ctx=services_ctx,
             )
         return self._run_host_smoke(
@@ -229,6 +408,7 @@ class OpenClawHarness:
         run_id: str,
         cfg: "Config",
         sandbox_handle: "ContainerHandle",
+        user_agent: "UserAgent | None" = None,
         services_ctx: "ServiceManager | None",
     ) -> HarnessResult:
         """Production form: OpenClaw + bridge + sandbox server in container,
@@ -317,21 +497,53 @@ class OpenClawHarness:
             # The CLAWEVAL_BRIDGE_LOG env was set on container start
             # (volumes + extra_env) so the plugin can append to the
             # host-visible log file inside the container.
-            raw = _openclaw_container.run_in_container(
-                prompt=task.prompt.text,
-                container=sandbox_handle.container,
-                work_dir_host="/workspace",
-                case_dir_host=str(case_dir),
-                timeout_s=float(task.environment.timeout_seconds),
-                api_provider={
-                    "baseUrl": cfg.model.base_url,
-                    "model": cfg.model.model_id,
-                    "apiKey": cfg.model.api_key,
-                    "provider_type": "openai",
-                },
-                extra_plugins=[bridge.plugin_id] if bridge.plugin_id else [],
-                seeded_config_path=str(config_path),
+            #
+            # One ``openclaw agent`` call = one turn. ``run_turn`` closes over
+            # all the container/provider/bridge context so the multi-turn
+            # driver only varies the message + session_key. For a single-turn
+            # task (user_agent is None) the driver makes exactly one call with
+            # session_key=None — byte-identical to the pre-multi-turn path.
+            def run_turn(message: str, session_key: "str | None") -> dict:
+                return _openclaw_container.run_in_container(
+                    prompt=message,
+                    container=sandbox_handle.container,
+                    work_dir_host="/workspace",
+                    case_dir_host=str(case_dir),
+                    timeout_s=float(task.environment.timeout_seconds),
+                    api_provider={
+                        "baseUrl": cfg.model.base_url,
+                        "model": cfg.model.model_id,
+                        "apiKey": cfg.model.api_key,
+                        "provider_type": "openai",
+                    },
+                    extra_plugins=[bridge.plugin_id] if bridge.plugin_id else [],
+                    seeded_config_path=str(config_path),
+                    session_key=session_key,
+                )
+
+            ua_cfg = getattr(task, "user_agent", None)
+            ua_enabled = (
+                user_agent is not None
+                and ua_cfg is not None
+                and getattr(ua_cfg, "enabled", False)
             )
+            drive = _drive_user_agent_turns(
+                prompt=task.prompt.text,
+                run_turn=run_turn,
+                user_agent=user_agent if ua_enabled else None,
+                persona=getattr(ua_cfg, "persona", "") if ua_cfg is not None else "",
+                max_rounds=int(getattr(ua_cfg, "max_rounds", 0) or 0)
+                if ua_cfg is not None
+                else 0,
+                agent_id="main",
+                run_id=run_id,
+            )
+            turns = drive["turns"]
+            # Last turn carries status/usage/llm meta; the merged stream below
+            # carries the FULL multi-turn conversation (every turn's
+            # executionTrace + a [user_agent] user event between turns).
+            raw = turns[-1] if turns else {}
+            merged_execution_trace = _merge_turn_traces(turns, drive["injected"])
 
             # ---- 4. Inject grader files (AFTER agent exit) ----
             SandboxRunner.inject_grader_files(
@@ -347,7 +559,7 @@ class OpenClawHarness:
             # ---- 7. Translate trace ----
             trace_blob = raw.get("trace") or {}
             trace_path = translate_openclaw(
-                execution_trace=trace_blob.get("executionTrace") or [],
+                execution_trace=merged_execution_trace,
                 usage_total=trace_blob.get("usageTotal") or {},
                 llm_meta=trace_blob.get("llm") or {},
                 bridge_log_path=bridge.traffic_log_path,
@@ -357,6 +569,11 @@ class OpenClawHarness:
                 trace_dir=trace_dir,
                 duration_ms=int(raw.get("durationMs") or 0),
                 status=str(raw.get("status") or "ok"),
+                user_agent_rounds=int(drive.get("rounds") or 0),
+                user_agent_max_rounds=int(
+                    getattr(getattr(task, "user_agent", None), "max_rounds", 0) or 0
+                ),
+                user_agent_done=bool(drive.get("done")),
             )
 
             raw_dir_path = (

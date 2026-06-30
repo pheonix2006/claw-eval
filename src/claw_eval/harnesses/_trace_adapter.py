@@ -211,6 +211,9 @@ def translate_openclaw(
     trace_dir: Path,
     duration_ms: int,
     status: str,
+    user_agent_rounds: int = 0,
+    user_agent_max_rounds: int = 0,
+    user_agent_done: bool = False,
 ) -> Path:
     """Translate an OpenClaw session + bridge log into a claw-eval trace JSONL.
 
@@ -494,6 +497,9 @@ def translate_openclaw(
                 other_time_s=0.0,
                 wall_time_s=wall_time_s,
                 failure_modes=failure_modes,
+                user_agent_rounds=user_agent_rounds,
+                user_agent_max_rounds=user_agent_max_rounds,
+                user_agent_done=user_agent_done,
             )
         )
 

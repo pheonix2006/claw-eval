@@ -1,0 +1,25 @@
+# C smoke config — OpenClaw harness 原生多轮 user_agent 验证
+# agent(被测) = z.ai glm-5v-turbo（OpenClaw 驱动）
+# judge + user_agent 也临时用 z.ai glm-5v-turbo —— 仅为验证 C 的多轮循环跑通；
+# newapi 的 gemini-3-flash-preview 端点当前返回空 choices（AttributeError），
+# 是端点问题、与 C 无关，故 smoke 阶段避开它。正式跑分再换回稳定 judge。
+model:
+  api_key: ${ZAI_API_KEY}
+  base_url: https://api.z.ai/api/coding/paas/v4
+  model_id: glm-5v-turbo
+  context_window: 200000
+
+judge:
+  api_key: ${ZAI_API_KEY}
+  base_url: https://api.z.ai/api/coding/paas/v4
+  model_id: glm-5v-turbo
+  enabled: true
+
+user_agent_model:
+  api_key: ${ZAI_API_KEY}
+  base_url: https://api.z.ai/api/coding/paas/v4
+  model_id: glm-5v-turbo
+
+defaults:
+  trace_dir: traces
+  tasks_dir: tasks

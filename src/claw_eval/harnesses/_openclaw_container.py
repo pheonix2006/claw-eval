@@ -88,6 +88,33 @@ def _docker_exec(
     )
 
 
+def _build_agent_cmd(
+    *,
+    prompt: str,
+    agent_id: str,
+    timeout_s: float,
+    session_key: Optional[str] = None,
+) -> "list[str]":
+    """Build the ``openclaw agent`` argv for a single in-container turn.
+
+    Pure (no I/O) so the flag wiring — notably the multi-turn
+    ``--session-key`` — is unit-testable without a Docker container. When
+    ``session_key`` is None the flag is omitted, leaving single-turn behaviour
+    byte-identical to the pre-multi-turn command.
+    """
+    cmd: list[str] = [
+        "openclaw", "--no-color", "--log-level", "silent",
+        "agent", "--local", "--json",
+        "--message", prompt,
+        "--agent", str(agent_id),
+    ]
+    if session_key:
+        cmd.extend(["--session-key", str(session_key)])
+    if isinstance(timeout_s, (int, float)) and timeout_s > 0:
+        cmd.extend(["--timeout", str(int(timeout_s))])
+    return cmd
+
+
 def run_in_container(
     *,
     prompt: str,
@@ -99,6 +126,7 @@ def run_in_container(
     extra_plugins: Optional[List[str]] = None,
     agent_id: Optional[str] = None,
     seeded_config_path: Optional[str] = None,
+    session_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Drive an OpenClaw subprocess inside ``container``.
 
@@ -136,6 +164,13 @@ def run_in_container(
         Optional pre-built ``openclaw.json`` (the host harness uses this to
         seed ``tools.deny``). When given, we still merge model/agent keys
         into it via ``_build_openclaw_temp_config``.
+    session_key:
+        Optional OpenClaw session key (``agent:<id>:<key>``). When set, it is
+        passed via ``--session-key`` so consecutive calls with the SAME key
+        reuse OpenClaw's persisted session context — the mechanism the
+        multi-turn user_agent loop relies on to accumulate the conversation
+        across independent CLI invocations. ``None`` (default) omits the flag,
+        keeping single-turn behaviour byte-identical.
     """
     started_at = time.time()
     raw_dir_host = os.path.join(case_dir_host, "raw")
@@ -252,14 +287,12 @@ def run_in_container(
         pass
 
     # ---- The actual OpenClaw subprocess. ----
-    oc_cmd: list[str] = [
-        "openclaw", "--no-color", "--log-level", "silent",
-        "agent", "--local", "--json",
-        "--message", prompt,
-        "--agent", str(resolved_agent_id),
-    ]
-    if isinstance(timeout_s, (int, float)) and timeout_s > 0:
-        oc_cmd.extend(["--timeout", str(int(timeout_s))])
+    oc_cmd = _build_agent_cmd(
+        prompt=prompt,
+        agent_id=resolved_agent_id,
+        timeout_s=timeout_s,
+        session_key=session_key,
+    )
 
     # docker exec needs a slightly bigger timeout than OpenClaw's own
     # ``--timeout`` so we get to read the JSON output before docker kills
