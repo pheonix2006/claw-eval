@@ -10,6 +10,18 @@ from openai import OpenAI
 from ..models.message import Message
 
 
+class _NonCompletionResponse(RuntimeError):
+    """The endpoint returned a body that is not an OpenAI chat completion.
+
+    Same failure mode as the judge's: a ``base_url`` missing the ``/v1`` API
+    path makes a gateway answer with its HTML homepage (HTTP 200), which the
+    OpenAI SDK turns into a ``str`` whose ``.choices`` access raises. That is a
+    configuration error, not transient — fail loud immediately rather than
+    burning 30 retries and then silently ending the conversation (which would
+    collapse a multi-turn task into a single turn).
+    """
+
+
 _SYSTEM_PROMPT = """\
 你是一个模拟用户。你的任务是根据以下人设与AI助手进行对话。
 
@@ -55,6 +67,7 @@ class UserAgent:
     ) -> None:
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model_id = model_id
+        self.base_url = base_url
 
     def generate_response(
         self,
@@ -73,6 +86,7 @@ class UserAgent:
         )
 
         max_retries = 30
+        last_exc: Exception | None = None
         for attempt in range(max_retries):
             try:
                 resp = self.client.chat.completions.create(
@@ -84,13 +98,24 @@ class UserAgent:
                     temperature=0.7,
                     max_tokens=65536,
                 )
+                if isinstance(resp, str) or not hasattr(resp, "choices") or not resp.choices:
+                    raise _NonCompletionResponse(
+                        f"user_agent endpoint returned a non-completion response "
+                        f"(type={type(resp).__name__}) — base_url {self.base_url!r} "
+                        f"likely needs the '/v1' API path. Body preview: "
+                        f"{str(resp)[:200]!r}"
+                    )
                 text = (resp.choices[0].message.content or "").strip()
                 if "[DONE]" in text:
                     return None
                 if text:
                     return text
                 return None
+            except _NonCompletionResponse:
+                # Misconfigured endpoint (non-JSON body) — retrying never helps.
+                raise
             except Exception as exc:
+                last_exc = exc
                 delay = min(2 ** (attempt + 1), 16) + random.uniform(0, 1)
                 print(
                     f"[user-agent-retry] {type(exc).__name__}, "
@@ -98,5 +123,9 @@ class UserAgent:
                 )
                 time.sleep(delay)
 
-        # All retries exhausted — gracefully end the conversation
-        return None
+        # All retries exhausted — fail loud rather than silently returning None
+        # (a silent None would be read as the user being satisfied, collapsing a
+        # multi-turn task into a single turn and scoring it as if complete).
+        raise RuntimeError(
+            f"UserAgent.generate_response failed after {max_retries} retries"
+        ) from last_exc

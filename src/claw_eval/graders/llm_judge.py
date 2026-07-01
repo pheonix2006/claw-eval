@@ -13,6 +13,19 @@ from pydantic import BaseModel
 from ..models.trace import _now
 
 
+class _NonCompletionResponse(RuntimeError):
+    """The endpoint returned a body that is not an OpenAI chat completion.
+
+    The classic trigger is a gateway (e.g. new-api) whose ``base_url`` is
+    missing the ``/v1`` API path: the request falls through to the SPA, which
+    answers the unknown route with its HTML homepage and HTTP 200. The OpenAI
+    SDK then deserialises that HTML into a plain ``str``, so ``resp.choices``
+    raises ``AttributeError``. That is a configuration error, never transient —
+    retrying it 30 times just hides the cause, so we raise immediately with an
+    actionable message instead of feeding it into the retry loop.
+    """
+
+
 class JudgeResult(BaseModel):
     score: float  # 0.0-1.0
     reasoning: str
@@ -71,7 +84,27 @@ class LLMJudge:
     ) -> None:
         self.client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
         self.model_id = model_id
+        self.base_url = base_url
         self._call_log: list[dict] = []
+
+    def _content_or_raise(self, resp) -> str:
+        """Return the first choice's text, or raise.
+
+        Raises :class:`_NonCompletionResponse` (NOT retried) when ``resp`` is not
+        a completion object at all — the tell-tale sign of a ``base_url`` missing
+        the ``/v1`` API path. Raises ``ValueError`` (retried) when choices are
+        present but empty (a genuine transient hiccup).
+        """
+        if isinstance(resp, str) or not hasattr(resp, "choices"):
+            raise _NonCompletionResponse(
+                f"judge endpoint returned a non-completion response "
+                f"(type={type(resp).__name__}) — base_url {self.base_url!r} "
+                f"likely needs the '/v1' API path. Body preview: "
+                f"{str(resp)[:200]!r}"
+            )
+        if not resp.choices:
+            raise ValueError("judge endpoint returned empty choices")
+        return resp.choices[0].message.content or "{}"
 
     def evaluate(
         self,
@@ -100,7 +133,7 @@ class LLMJudge:
                     temperature=0.0,
                     max_tokens=8192,
                 )
-                raw = resp.choices[0].message.content or "{}"
+                raw = self._content_or_raise(resp)
                 # Strip markdown code fences if present
                 raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
                 raw = re.sub(r"\s*```$", "", raw.strip())
@@ -132,6 +165,9 @@ class LLMJudge:
                     "timestamp": _now(),
                 })
                 return result
+            except _NonCompletionResponse:
+                # Misconfigured endpoint (non-JSON body) — retrying never helps.
+                raise
             except Exception as exc:
                 last_exc = exc
                 status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
@@ -139,6 +175,10 @@ class LLMJudge:
                 print(f"[judge-retry] ({status or type(exc).__name__}), "
                       f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
                 time.sleep(delay)
+
+        raise RuntimeError(
+            f"LLMJudge.evaluate failed after {max_retries} retries"
+        ) from last_exc
 
     def evaluate_actions(
         self,
@@ -170,7 +210,7 @@ class LLMJudge:
                     temperature=0.0,
                     max_tokens=8192,
                 )
-                raw = resp.choices[0].message.content or "{}"
+                raw = self._content_or_raise(resp)
                 raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
                 raw = re.sub(r"\s*```$", "", raw.strip())
                 m = re.search(r'\{[^{}]*\}', raw)
@@ -200,6 +240,9 @@ class LLMJudge:
                     "timestamp": _now(),
                 })
                 return result
+            except _NonCompletionResponse:
+                # Misconfigured endpoint (non-JSON body) — retrying never helps.
+                raise
             except Exception as exc:
                 last_exc = exc
                 status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
@@ -207,6 +250,10 @@ class LLMJudge:
                 print(f"[judge-retry] ({status or type(exc).__name__}), "
                       f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
                 time.sleep(delay)
+
+        raise RuntimeError(
+            f"LLMJudge.evaluate_actions failed after {max_retries} retries"
+        ) from last_exc
 
     def evaluate_visual(
         self,
@@ -272,7 +319,7 @@ class LLMJudge:
                     temperature=0.0,
                     max_tokens=8192,
                 )
-                raw = resp.choices[0].message.content or "{}"
+                raw = self._content_or_raise(resp)
                 raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
                 raw = re.sub(r"\s*```$", "", raw.strip())
                 m = re.search(r'\{[^{}]*\}', raw)
@@ -305,6 +352,9 @@ class LLMJudge:
                 })
                 print(f"[judge-visual] score={result.score:.2f} reasoning={result.reasoning[:200]}")
                 return result
+            except _NonCompletionResponse:
+                # Misconfigured endpoint (non-JSON body) — retrying never helps.
+                raise
             except Exception as exc:
                 last_exc = exc
                 status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
@@ -312,6 +362,10 @@ class LLMJudge:
                 print(f"[judge-visual-retry] ({status or type(exc).__name__}), "
                       f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
                 time.sleep(delay)
+
+        raise RuntimeError(
+            f"LLMJudge.evaluate_visual failed after {max_retries} retries"
+        ) from last_exc
 
     def get_call_log(self) -> list[dict]:
         return list(self._call_log)

@@ -1,8 +1,12 @@
 # C smoke config — OpenClaw harness 原生多轮 user_agent 验证
 # agent(被测) = z.ai glm-5v-turbo（OpenClaw 驱动）
-# judge + user_agent 也临时用 z.ai glm-5v-turbo —— 仅为验证 C 的多轮循环跑通；
-# newapi 的 gemini-3-flash-preview 端点当前返回空 choices（AttributeError），
-# 是端点问题、与 C 无关，故 smoke 阶段避开它。正式跑分再换回稳定 judge。
+# judge + user_agent 也用 z.ai glm-5v-turbo —— 仅为验证 C 的多轮循环跑通。
+# 历史备注更正(2026-06-30)：此前以为 newapi 的 gemini-3-flash-preview “返回空 choices
+# 是端点问题”属误诊。真因 = base_url 缺 '/v1'（裸 https://newapi.deepwisdom.ai 会落到
+# new-api 的 SPA 首页、返回 HTML 200，OpenAI SDK 解析成 str → resp.choices 抛
+# AttributeError）。加上 /v1 后 gemini-3-flash-preview 作 judge/ua 完全正常。
+# 外层 benchmark_eval 经 provider_config.normalize_base_url 已自动补 /v1，正式跑分无碍；
+# 此 smoke 直连 claw-eval 不走 normalize，用 z.ai 即可（与本验证目的无关）。
 model:
   api_key: ${ZAI_API_KEY}
   base_url: https://api.z.ai/api/coding/paas/v4
