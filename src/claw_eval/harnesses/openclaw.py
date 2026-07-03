@@ -515,6 +515,7 @@ class OpenClawHarness:
                         "model": cfg.model.model_id,
                         "apiKey": cfg.model.api_key,
                         "provider_type": "openai",
+                        "thinking": bool(getattr(cfg.model, "thinking", False)),
                     },
                     extra_plugins=[bridge.plugin_id] if bridge.plugin_id else [],
                     seeded_config_path=str(config_path),
@@ -731,6 +732,7 @@ class OpenClawHarness:
                         "model": cfg.model.model_id,
                         "apiKey": cfg.model.api_key,
                         "provider_type": "openai",
+                        "thinking": bool(getattr(cfg.model, "thinking", False)),
                     },
                     extra_plugins=[bridge.plugin_id] if bridge.plugin_id else [],
                 )

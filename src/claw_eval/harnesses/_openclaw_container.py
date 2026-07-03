@@ -94,6 +94,7 @@ def _build_agent_cmd(
     agent_id: str,
     timeout_s: float,
     session_key: Optional[str] = None,
+    thinking: bool = False,
 ) -> "list[str]":
     """Build the ``openclaw agent`` argv for a single in-container turn.
 
@@ -110,6 +111,8 @@ def _build_agent_cmd(
     ]
     if session_key:
         cmd.extend(["--session-key", str(session_key)])
+    if thinking:
+        cmd.extend(["--thinking", "on"])
     if isinstance(timeout_s, (int, float)) and timeout_s > 0:
         cmd.extend(["--timeout", str(int(timeout_s))])
     return cmd
@@ -190,11 +193,16 @@ def run_in_container(
     base_url = api_provider.get("baseUrl") if isinstance(api_provider, dict) else None
     model = api_provider.get("model") if isinstance(api_provider, dict) else None
     api_key = api_provider.get("apiKey") if isinstance(api_provider, dict) else None
+    thinking = bool(api_provider.get("thinking")) if isinstance(api_provider, dict) else False
     provider_id = (
         str(api_provider.get("provider_type") or "openai")
         if isinstance(api_provider, dict)
         else "openai"
     )
+    # thinking on 时归一 provider id 为 "vllm"（openclaw 的 --thinking gate
+    # isVllmQwenThinkingCompat 只认 vllm；对齐外层 OpenClawRuntime 做法）。
+    if thinking:
+        provider_id = "vllm"
 
     resolved_agent_id = str(agent_id or "").strip() or "main"
 
@@ -218,6 +226,7 @@ def run_in_container(
                     target_model=model.strip(),
                     target_api_key=api_key.strip() if isinstance(api_key, str) and api_key.strip() else None,
                     workspace_dir=os.path.abspath(work_dir_host),
+                    thinking=thinking,
                 )
             finally:
                 if prev_cfg_env is None:
@@ -292,6 +301,7 @@ def run_in_container(
         agent_id=resolved_agent_id,
         timeout_s=timeout_s,
         session_key=session_key,
+        thinking=thinking,
     )
 
     # docker exec needs a slightly bigger timeout than OpenClaw's own

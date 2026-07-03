@@ -213,6 +213,7 @@ def _build_openclaw_temp_config(
     target_model: str,
     target_api_key: Optional[str],
     workspace_dir: str,
+    thinking: bool = False,
 ) -> str:
     src_path = os.environ.get("OPENCLAW_CONFIG_PATH") or os.path.expanduser("~/.openclaw/openclaw.json")
     cfg: Dict[str, Json] = {}
@@ -237,14 +238,17 @@ def _build_openclaw_temp_config(
     provider_cfg["api"] = "openai-completions"
     if isinstance(target_api_key, str) and target_api_key:
         provider_cfg["apiKey"] = target_api_key
-    provider_cfg["models"] = [
-        {
-            "id": target_model,
-            "name": target_model,
-            "api": "openai-completions",
-            "input": _resolve_model_input_modalities(),
-        }
-    ]
+    model_entry = {
+        "id": target_model,
+        "name": target_model,
+        "api": "openai-completions",
+        "input": _resolve_model_input_modalities(),
+    }
+    if thinking:
+        # 对齐外层 OpenClawRuntime：openai-completions transport 只在 reasoning + qwen 格式下发 enable_thinking
+        model_entry["reasoning"] = True
+        model_entry["compat"] = {"thinkingFormat": "qwen"}
+    provider_cfg["models"] = [model_entry]
     providers[provider_id] = provider_cfg
     models["providers"] = providers
     cfg["models"] = models
