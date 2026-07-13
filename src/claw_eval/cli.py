@@ -524,6 +524,12 @@ def cmd_run(args: argparse.Namespace) -> None:
                     _net = os.environ.get("CLAWEVAL_SANDBOX_NET", "").strip().lower()
                     if _net != "bridge":
                         start_kwargs["network_mode"] = "host"
+                        # Host networking makes the in-container sandbox server
+                        # bind a fixed port (default 8080) directly on the host,
+                        # so concurrent `run --sandbox` workers collide. Give each
+                        # a unique port derived from its port_offset — mirrors
+                        # cmd_batch (see sandbox_port = 8080 + port_offset below).
+                        start_kwargs["sandbox_port"] = 8080 + port_offset
                     start_kwargs["volumes"] = {str(case_dir_mount): str(case_dir_mount)}
                     bridge_log_in_container = case_dir_mount / "raw" / "bridge_traffic.jsonl"
                     start_kwargs["extra_env"] = {
