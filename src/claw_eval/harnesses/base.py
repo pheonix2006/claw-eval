@@ -50,6 +50,8 @@ class HarnessResult:
     env_snapshot: dict | None         # workspace snapshot, if any
     audit_data: dict[str, dict]       # mock service /audit data, keyed by service name
     raw_dir: Path | None              # harness-private debug area
+    status: Literal["ok", "error", "timeout"] = "ok"
+    error_message: str | None = None
 
 
 class Harness(Protocol):

@@ -31,6 +31,7 @@ from claw_eval.models.task import (
     Prompt,
     TaskDefinition,
 )
+from claw_eval.models.tool import ToolSpec
 from claw_eval.models.trace import (
     AuditSnapshot,
     DimensionScores,
@@ -239,6 +240,35 @@ def test_load_trace_roundtrip(
         "call_purch_002",
     }
 
+
+def test_openclaw_core_exec_is_recorded_as_successful_sandbox_bash(tmp_path) -> None:
+    task = TaskDefinition(
+        task_id="T_exec",
+        task_name="exec fallback",
+        prompt=Prompt(text="run"),
+        environment=Environment(timeout_seconds=30, max_turns=3),
+        tools=[ToolSpec(name="Bash", description="shell", input_schema={"type": "object"})],
+    )
+    events = [
+        {"type": "text", "role": "assistant", "content": ""},
+        {"type": "tool", "role": "tool", "tool": "exec", "callID": "c1",
+         "input": {"command": "true"}, "output": {"text": ""},
+         "exitCode": 0, "status": "completed", "durationMs": 4},
+    ]
+    path = translate_openclaw(
+        execution_trace=events, usage_total={}, llm_meta={"model": "m"},
+        bridge_log_path=None, audit_data={}, task=task, run_id="r",
+        trace_dir=tmp_path, duration_ms=4, status="ok",
+    )
+    _, messages, dispatches, _, _, _ = load_trace(path)
+    use = next(block for msg in messages for block in msg.message.content
+               if isinstance(block, ToolUseBlock))
+    result = next(block for msg in messages for block in msg.message.content
+                  if isinstance(block, ToolResultBlock))
+    assert use.name == "Bash"
+    assert result.is_error is False
+    assert dispatches[0].tool_name == "Bash"
+    assert dispatches[0].response_status == 200
 
 # ---------------------------------------------------------------------------
 # 3) Grader can consume the translated trace

@@ -14,6 +14,7 @@ exercise the OpenClaw CLI — that's the Wave 3 §6.5 e2e job and would require
 from __future__ import annotations
 
 import inspect
+import json
 
 
 def test_module_imports() -> None:
@@ -63,6 +64,30 @@ def test_extract_openclaw_trace_signature() -> None:
             f"_extract_openclaw_trace must keep keyword arg {name!r}"
         )
         assert sig.parameters[name].kind == inspect.Parameter.KEYWORD_ONLY
+
+
+def test_extract_places_assistant_before_its_tool_call(tmp_path) -> None:
+    from claw_eval.harnesses import _openclaw_native
+
+    session = tmp_path / "session.jsonl"
+    session.write_text(
+        json.dumps({
+            "type": "message", "timestamp": "2026-01-01T00:00:00Z",
+            "message": {
+                "role": "assistant", "provider": "openai", "model": "m",
+                "content": [{"type": "toolCall", "id": "call-1", "name": "Bash",
+                             "arguments": {"command": "true"}}],
+                "usage": {"input": 1, "output": 1, "totalTokens": 2},
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+    trace = _openclaw_native._extract_openclaw_trace(
+        session_jsonl_path=str(session), base_url="http://localhost/v1", model="m"
+    )
+    assert [(e["type"], e["role"]) for e in trace["executionTrace"]] == [
+        ("text", "assistant"), ("tool", "tool")
+    ]
 
 
 def test_public_helpers_present() -> None:

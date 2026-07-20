@@ -883,6 +883,7 @@ def _extract_openclaw_trace(*, session_jsonl_path: str, base_url: Optional[str],
                     model = str(msg.get("model"))
                 content = msg.get("content")
                 text_parts: List[str] = []
+                tool_events: List[Json] = []
                 if isinstance(content, list):
                     for c in content:
                         if not isinstance(c, dict):
@@ -907,7 +908,7 @@ def _extract_openclaw_trace(*, session_jsonl_path: str, base_url: Optional[str],
                                     "output": None,
                                     "exitCode": None,
                                 }
-                                execution_trace.append(ev)
+                                tool_events.append(ev)
                                 tool_index[tcid] = ev
                 text = "\n".join([t for t in text_parts if t]).strip()
                 if text:
@@ -931,6 +932,10 @@ def _extract_openclaw_trace(*, session_jsonl_path: str, base_url: Optional[str],
                         },
                     }
                 )
+                # Keep the assistant message before its tool calls. The trace
+                # adapter attaches each ToolUseBlock to the most recent
+                # assistant message and native ClawEval uses the same order.
+                execution_trace.extend(tool_events)
                 continue
 
             if role == "toolResult":

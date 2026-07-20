@@ -39,10 +39,12 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import _openclaw_bridge, _openclaw_container, _openclaw_native
+from ._openclaw_model_budget import OpenClawModelBudgetProxy
 from ._snapshot import collect_workdir_snapshot, inject_grader_files_host
 from ._trace_adapter import translate_openclaw
 from .base import HarnessResult
@@ -131,7 +133,9 @@ def _turn_final_text(raw: "dict") -> str:
     return ""
 
 
-def _rebuild_conversation(turns: "list[dict]", injected: "list[str]") -> "list":
+def _rebuild_conversation(
+    prompt: str, turns: "list[dict]", injected: "list[str]"
+) -> "list":
     """Reconstruct a ``list[Message]`` for ``UserAgent.generate_response``.
 
     The native loop hands the UserAgent the full running ``messages`` list; the
@@ -147,7 +151,7 @@ def _rebuild_conversation(turns: "list[dict]", injected: "list[str]") -> "list":
     from ..models.content import TextBlock
     from ..models.message import Message
 
-    msgs: list = []
+    msgs: list = [Message(role="user", content=[TextBlock(text=prompt)])]
     for idx, raw in enumerate(turns):
         answer = _turn_final_text(raw)
         if answer:
@@ -182,7 +186,20 @@ def _merge_turn_traces(turns: "list[dict]", injected: "list[str]") -> "list[dict
         trace = raw.get("trace") if isinstance(raw, dict) else None
         events = trace.get("executionTrace") if isinstance(trace, dict) else None
         if isinstance(events, list):
-            merged.extend(e for e in events if isinstance(e, dict))
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                llm = event.get("llm") if isinstance(event.get("llm"), dict) else {}
+                error_message = str(llm.get("errorMessage") or "")
+                # The budget proxy's rejected N+1 request is a control signal,
+                # not a model turn. Native ClawEval would stop before making
+                # that call, so do not leak OpenClaw's synthetic error message
+                # into the graded trace or total_turns.
+                if "claw_eval_max_turns_exceeded" in error_message or (
+                    "ClawEval max_turns exceeded" in error_message
+                ):
+                    continue
+                merged.append(event)
     return merged
 
 
@@ -195,6 +212,8 @@ def _drive_user_agent_turns(
     max_rounds: int,
     agent_id: str,
     run_id: str,
+    deadline: float | None = None,
+    clock=time.monotonic,
 ) -> "dict":
     """Drive the simulated-user multi-turn loop for the OpenClaw arm.
 
@@ -221,6 +240,13 @@ def _drive_user_agent_turns(
     "session_key": str | None}``.
     """
     if user_agent is None:
+        if deadline is not None and clock() >= deadline:
+            return {
+                "turns": [], "injected": [], "rounds": 0, "done": False,
+                "session_key": None, "terminal_status": "timeout",
+                "deadline_exhausted": True,
+                "error_message": "task deadline exhausted before first turn",
+            }
         raw = run_turn(prompt, None)
         return {
             "turns": [raw],
@@ -228,6 +254,9 @@ def _drive_user_agent_turns(
             "rounds": 0,
             "done": False,
             "session_key": None,
+            "terminal_status": str(raw.get("status") or "ok"),
+            "deadline_exhausted": False,
+            "error_message": raw.get("errorMessage"),
         }
 
     session_key = f"agent:{agent_id}:claweval-{run_id}"
@@ -235,16 +264,30 @@ def _drive_user_agent_turns(
     injected: list[str] = []
     rounds = 0
     done = False
+    terminal_status = "ok"
+    deadline_exhausted = False
+    error_message = None
 
     message = prompt
     while True:
+        if deadline is not None and clock() >= deadline:
+            terminal_status = "timeout"
+            deadline_exhausted = True
+            error_message = "task-global agent deadline exhausted"
+            break
         raw = run_turn(message, session_key)
         turns.append(raw)
+
+        raw_status = str(raw.get("status") or "ok")
+        if raw_status != "ok":
+            terminal_status = raw_status
+            error_message = raw.get("errorMessage") or raw.get("error")
+            break
 
         if rounds >= max_rounds:
             break
 
-        transcript = _rebuild_conversation(turns, injected)
+        transcript = _rebuild_conversation(prompt, turns, injected)
         reply = user_agent.generate_response(
             persona=persona, conversation_messages=transcript
         )
@@ -262,6 +305,9 @@ def _drive_user_agent_turns(
         "rounds": rounds,
         "done": done,
         "session_key": session_key,
+        "terminal_status": terminal_status,
+        "deadline_exhausted": deadline_exhausted,
+        "error_message": error_message,
     }
 
 
@@ -325,7 +371,9 @@ class OpenClawHarness:
     """
 
     name = "openclaw"
-    supported_features = frozenset({"http_services", "sandbox_tools", "user_agent"})
+    supported_features = frozenset(
+        {"http_services", "sandbox_tools", "user_agent", "max_turns_strict"}
+    )
 
     # ------------------------------------------------------------------
     # Preflight
@@ -503,42 +551,56 @@ class OpenClawHarness:
             # driver only varies the message + session_key. For a single-turn
             # task (user_agent is None) the driver makes exactly one call with
             # session_key=None — byte-identical to the pre-multi-turn path.
-            def run_turn(message: str, session_key: "str | None") -> dict:
-                return _openclaw_container.run_in_container(
-                    prompt=message,
-                    container=sandbox_handle.container,
-                    work_dir_host="/workspace",
-                    case_dir_host=str(case_dir),
-                    timeout_s=float(task.environment.timeout_seconds),
-                    api_provider={
-                        "baseUrl": cfg.model.base_url,
-                        "model": cfg.model.model_id,
-                        "apiKey": cfg.model.api_key,
-                        "provider_type": "openai",
-                        "thinking": bool(getattr(cfg.model, "thinking", False)),
-                    },
-                    extra_plugins=[bridge.plugin_id] if bridge.plugin_id else [],
-                    seeded_config_path=str(config_path),
-                    session_key=session_key,
-                )
-
             ua_cfg = getattr(task, "user_agent", None)
             ua_enabled = (
                 user_agent is not None
                 and ua_cfg is not None
                 and getattr(ua_cfg, "enabled", False)
             )
-            drive = _drive_user_agent_turns(
-                prompt=task.prompt.text,
-                run_turn=run_turn,
-                user_agent=user_agent if ua_enabled else None,
-                persona=getattr(ua_cfg, "persona", "") if ua_cfg is not None else "",
-                max_rounds=int(getattr(ua_cfg, "max_rounds", 0) or 0)
-                if ua_cfg is not None
-                else 0,
-                agent_id="main",
-                run_id=run_id,
-            )
+            # Native ClawEval owns one task-global agent-loop deadline and one
+            # max_turns counter.  OpenClaw otherwise resets timeout on every
+            # user-agent CLI call and can make unbounded provider calls inside
+            # a single call, so share both controls across the whole task.
+            deadline = time.monotonic() + float(task.environment.timeout_seconds)
+            with OpenClawModelBudgetProxy(
+                target_base_url=cfg.model.base_url,
+                max_completions=int(task.environment.max_turns),
+                evidence_path=raw_dir / "model_budget.json",
+            ) as model_budget:
+                def run_turn(message: str, session_key: "str | None") -> dict:
+                    remaining = max(1.0, deadline - time.monotonic())
+                    return _openclaw_container.run_in_container(
+                        prompt=message,
+                        container=sandbox_handle.container,
+                        work_dir_host="/workspace",
+                        case_dir_host=str(case_dir),
+                        timeout_s=remaining,
+                        api_provider={
+                            "baseUrl": model_budget.base_url,
+                            "model": cfg.model.model_id,
+                            "apiKey": cfg.model.api_key,
+                            "provider_type": "openai",
+                            "thinking": bool(getattr(cfg.model, "thinking", False)),
+                        },
+                        extra_plugins=[bridge.plugin_id] if bridge.plugin_id else [],
+                        seeded_config_path=str(config_path),
+                        session_key=session_key,
+                    )
+
+                drive = _drive_user_agent_turns(
+                    prompt=task.prompt.text,
+                    run_turn=run_turn,
+                    user_agent=user_agent if ua_enabled else None,
+                    persona=getattr(ua_cfg, "persona", "") if ua_cfg is not None else "",
+                    max_rounds=int(getattr(ua_cfg, "max_rounds", 0) or 0)
+                    if ua_cfg is not None
+                    else 0,
+                    agent_id="main",
+                    run_id=run_id,
+                    deadline=deadline,
+                )
+                budget_exhausted = model_budget.exhausted
+                completion_count = model_budget.completion_count
             turns = drive["turns"]
             # Last turn carries status/usage/llm meta; the merged stream below
             # carries the FULL multi-turn conversation (every turn's
@@ -559,17 +621,36 @@ class OpenClawHarness:
 
             # ---- 7. Translate trace ----
             trace_blob = raw.get("trace") or {}
+            usage_total: dict[str, int] = {}
+            duration_ms = 0
+            for turn in turns:
+                turn_trace = turn.get("trace") if isinstance(turn, dict) else {}
+                turn_usage = turn_trace.get("usageTotal") if isinstance(turn_trace, dict) else {}
+                if isinstance(turn_usage, dict):
+                    for key, value in turn_usage.items():
+                        if isinstance(value, (int, float)):
+                            usage_total[key] = usage_total.get(key, 0) + int(value)
+                duration_ms += int(turn.get("durationMs") or 0)
+
+            # Reaching max_turns or the native task deadline is an intentional
+            # rollout boundary: preserve and grade the partial trace just as
+            # the native loop does. Other OpenClaw/provider failures are
+            # infrastructure failures and must not be sent to the grader.
+            terminal_status = str(drive.get("terminal_status") or "ok")
+            intentional_boundary = budget_exhausted or bool(drive.get("deadline_exhausted"))
+            harness_status = "ok" if intentional_boundary else terminal_status
+            trace_status = "ok" if budget_exhausted else terminal_status
             trace_path = translate_openclaw(
                 execution_trace=merged_execution_trace,
-                usage_total=trace_blob.get("usageTotal") or {},
+                usage_total=usage_total,
                 llm_meta=trace_blob.get("llm") or {},
                 bridge_log_path=bridge.traffic_log_path,
                 audit_data=audit_data,
                 task=task,
                 run_id=run_id,
                 trace_dir=trace_dir,
-                duration_ms=int(raw.get("durationMs") or 0),
-                status=str(raw.get("status") or "ok"),
+                duration_ms=duration_ms,
+                status=trace_status,
                 user_agent_rounds=int(drive.get("rounds") or 0),
                 user_agent_max_rounds=int(
                     getattr(getattr(task, "user_agent", None), "max_rounds", 0) or 0
@@ -587,6 +668,12 @@ class OpenClawHarness:
                 env_snapshot=env_snapshot,
                 audit_data=audit_data,
                 raw_dir=raw_dir_path,
+                status=harness_status,
+                error_message=(
+                    None
+                    if harness_status == "ok"
+                    else str(drive.get("error_message") or "OpenClaw rollout failed")
+                ),
             )
         finally:
             bridge.cleanup()
