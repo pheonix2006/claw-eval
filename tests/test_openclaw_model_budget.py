@@ -6,7 +6,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 
-from claw_eval.harnesses._openclaw_model_budget import OpenClawModelBudgetProxy
+from claw_eval.harnesses._openclaw_model_budget import (
+    OpenClawModelBudgetProxy,
+    _target_url,
+)
 
 
 class _UpstreamHandler(BaseHTTPRequestHandler):
@@ -25,6 +28,18 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+def test_target_url_treats_configured_base_as_complete_api_root() -> None:
+    assert _target_url(
+        "https://api.openai.example/v1", "/v1/chat/completions"
+    ) == "https://api.openai.example/v1/chat/completions"
+    assert _target_url(
+        "https://api.z.ai/api/coding/paas/v4", "/v1/chat/completions"
+    ) == "https://api.z.ai/api/coding/paas/v4/chat/completions"
+    assert _target_url(
+        "https://api.example", "/v1/chat/completions"
+    ) == "https://api.example/v1/chat/completions"
 
 
 def test_model_budget_proxy_forwards_stream_and_rejects_n_plus_one(tmp_path) -> None:

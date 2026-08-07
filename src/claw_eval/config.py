@@ -46,8 +46,10 @@ class ModelConfig(BaseModel):
     system_prompt_prefix: str | None = None
     extra_body: dict | None = None
     thinking: bool = False
+    thinking_format: str | None = None
     reasoning_effort: str | None = None
     context_window: int = 262144
+    max_tokens: int | None = Field(default=None, gt=0)
     temperature: float | None = 0.0  # None = don't send temperature param
 
 

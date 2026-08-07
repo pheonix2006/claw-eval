@@ -194,6 +194,9 @@ def run_in_container(
     model = api_provider.get("model") if isinstance(api_provider, dict) else None
     api_key = api_provider.get("apiKey") if isinstance(api_provider, dict) else None
     thinking = bool(api_provider.get("thinking")) if isinstance(api_provider, dict) else False
+    thinking_format = api_provider.get("thinking_format") if isinstance(api_provider, dict) else None
+    context_window = api_provider.get("context_window") if isinstance(api_provider, dict) else None
+    max_tokens = api_provider.get("max_tokens") if isinstance(api_provider, dict) else None
     provider_id = (
         str(api_provider.get("provider_type") or "openai")
         if isinstance(api_provider, dict)
@@ -227,6 +230,24 @@ def run_in_container(
                     target_api_key=api_key.strip() if isinstance(api_key, str) and api_key.strip() else None,
                     workspace_dir=os.path.abspath(work_dir_host),
                     thinking=thinking,
+                    thinking_format=thinking_format,
+                    context_window=(
+                        context_window
+                        if isinstance(context_window, int) and not isinstance(context_window, bool)
+                        else None
+                    ),
+                    max_tokens=(
+                        max_tokens
+                        if isinstance(max_tokens, int) and not isinstance(max_tokens, bool)
+                        else None
+                    ),
+                    provider_timeout_sec=(
+                        int(timeout_s)
+                        if isinstance(timeout_s, (int, float))
+                        and not isinstance(timeout_s, bool)
+                        and timeout_s > 0
+                        else None
+                    ),
                 )
             finally:
                 if prev_cfg_env is None:

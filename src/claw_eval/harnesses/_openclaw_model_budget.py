@@ -28,7 +28,12 @@ _HOP_HEADERS = {
 
 def _target_url(base: str, path: str) -> str:
     base = base.rstrip("/")
-    if base.endswith("/v1") and path.startswith("/v1/"):
+    # ``base_url`` is already the provider's complete API root.  The local
+    # budget proxy advertises a synthetic ``/v1`` prefix to OpenClaw, so strip
+    # that prefix before appending an endpoint whenever the provider root
+    # already owns a path (for example Z.AI's ``/api/coding/paas/v4``).
+    # Preserve it only for origin-only bases such as ``https://api.example``.
+    if urlsplit(base).path.rstrip("/") and path.startswith("/v1/"):
         path = path[3:]
     return f"{base}/{path.lstrip('/')}"
 

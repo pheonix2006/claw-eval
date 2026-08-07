@@ -158,3 +158,61 @@ def test_build_openclaw_temp_config_declares_image_input(tmp_path, monkeypatch) 
     assert "image" in entry.get("input", []), (
         "model entry must declare image input so OpenClaw sends frames to the model"
     )
+
+
+def test_build_openclaw_temp_config_materializes_context_window(
+    tmp_path, monkeypatch
+) -> None:
+    import json
+
+    from claw_eval.harnesses import _openclaw_native
+
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    dst = str(tmp_path / "openclaw.json")
+    _openclaw_native._build_openclaw_temp_config(
+        dst_path=dst,
+        provider_id="openai",
+        target_base_url="http://127.0.0.1:8000/v1",
+        target_model="sft-4b-dsv4prolh",
+        target_api_key="local-placeholder",
+        workspace_dir=str(tmp_path),
+        context_window=65536,
+        max_tokens=65536,
+        provider_timeout_sec=1800,
+    )
+
+    cfg = json.loads((tmp_path / "openclaw.json").read_text())
+    provider = cfg["models"]["providers"]["openai"]
+    assert cfg["models"]["mode"] == "replace"
+    entry = provider["models"][0]
+    assert entry["contextWindow"] == 65536
+    assert entry["maxTokens"] == 65536
+    assert provider["timeoutSeconds"] == 1800
+    assert "reasoning" not in entry
+    assert "compat" not in entry
+
+
+def test_build_openclaw_temp_config_materializes_deepseek_thinking(
+    tmp_path, monkeypatch
+) -> None:
+    import json
+
+    from claw_eval.harnesses import _openclaw_native
+
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    dst = str(tmp_path / "openclaw.json")
+    _openclaw_native._build_openclaw_temp_config(
+        dst_path=dst,
+        provider_id="vllm",
+        target_base_url="https://newapi.deepwisdom.ai",
+        target_model="deepseek-v4-flash",
+        target_api_key="test-placeholder",
+        workspace_dir=str(tmp_path),
+        thinking=True,
+        thinking_format="deepseek",
+    )
+
+    cfg = json.loads((tmp_path / "openclaw.json").read_text())
+    entry = cfg["models"]["providers"]["vllm"]["models"][0]
+    assert entry["reasoning"] is True
+    assert entry["compat"] == {"thinkingFormat": "deepseek"}

@@ -214,6 +214,10 @@ def _build_openclaw_temp_config(
     target_api_key: Optional[str],
     workspace_dir: str,
     thinking: bool = False,
+    thinking_format: Optional[str] = None,
+    context_window: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    provider_timeout_sec: Optional[int] = None,
 ) -> str:
     src_path = os.environ.get("OPENCLAW_CONFIG_PATH") or os.path.expanduser("~/.openclaw/openclaw.json")
     cfg: Dict[str, Json] = {}
@@ -238,19 +242,37 @@ def _build_openclaw_temp_config(
     provider_cfg["api"] = "openai-completions"
     if isinstance(target_api_key, str) and target_api_key:
         provider_cfg["apiKey"] = target_api_key
+    if (
+        isinstance(provider_timeout_sec, int)
+        and not isinstance(provider_timeout_sec, bool)
+        and provider_timeout_sec > 0
+    ):
+        provider_cfg["timeoutSeconds"] = provider_timeout_sec
     model_entry = {
         "id": target_model,
         "name": target_model,
         "api": "openai-completions",
         "input": _resolve_model_input_modalities(),
     }
+    if isinstance(context_window, int) and not isinstance(context_window, bool) and context_window > 0:
+        model_entry["contextWindow"] = context_window
+    if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0:
+        model_entry["maxTokens"] = max_tokens
     if thinking:
-        # 对齐外层 OpenClawRuntime：openai-completions transport 只在 reasoning + qwen 格式下发 enable_thinking
         model_entry["reasoning"] = True
-        model_entry["compat"] = {"thinkingFormat": "qwen"}
+        if thinking_format not in (None, "qwen-chat-template", "deepseek"):
+            raise ValueError(f"unsupported OpenClaw thinking_format: {thinking_format}")
+        model_entry["compat"] = {
+            "thinkingFormat": thinking_format or "qwen"
+        }
     provider_cfg["models"] = [model_entry]
     providers[provider_id] = provider_cfg
     models["providers"] = providers
+    if context_window is not None or max_tokens is not None:
+        # The explicit entry owns the evaluated context/output contract.
+        # Merge mode can silently replace it with a larger value discovered
+        # from the self-hosted endpoint and defeat the estimator guard.
+        models["mode"] = "replace"
     cfg["models"] = models
 
     agents = cfg.get("agents")
@@ -1021,6 +1043,9 @@ def run(
     base_url = api_provider.get("baseUrl") if isinstance(api_provider, dict) else None
     model = api_provider.get("model") if isinstance(api_provider, dict) else None
     api_key = api_provider.get("apiKey") if isinstance(api_provider, dict) else None
+    context_window = api_provider.get("context_window") if isinstance(api_provider, dict) else None
+    max_tokens = api_provider.get("max_tokens") if isinstance(api_provider, dict) else None
+    thinking_format = api_provider.get("thinking_format") if isinstance(api_provider, dict) else None
     proxy_server = None
     proxy_thread = None
     proxy_url = None
@@ -1075,6 +1100,25 @@ def run(
                 target_model=model.strip(),
                 target_api_key=(api_key.strip() if isinstance(api_key, str) and api_key.strip() else None),
                 workspace_dir=os.path.abspath(work_dir),
+                thinking=bool(api_provider.get("thinking")) if isinstance(api_provider, dict) else False,
+                thinking_format=thinking_format,
+                context_window=(
+                    context_window
+                    if isinstance(context_window, int) and not isinstance(context_window, bool)
+                    else None
+                ),
+                max_tokens=(
+                    max_tokens
+                    if isinstance(max_tokens, int) and not isinstance(max_tokens, bool)
+                    else None
+                ),
+                provider_timeout_sec=(
+                    int(timeout_s)
+                    if isinstance(timeout_s, (int, float))
+                    and not isinstance(timeout_s, bool)
+                    and timeout_s > 0
+                    else None
+                ),
             )
         except Exception:
             env["OPENCLAW_CONFIG_PATH"] = config_path
