@@ -26,26 +26,50 @@ _HOP_HEADERS = {
 }
 
 
-def _target_url(base: str, path: str) -> str:
+_PROVIDER_TRANSPORTS = ("openai-completions", "anthropic-messages")
+
+
+def _target_url(
+    base: str,
+    path: str,
+    provider_transport: str = "openai-completions",
+) -> str:
     base = base.rstrip("/")
     # ``base_url`` is already the provider's complete API root.  The local
     # budget proxy advertises a synthetic ``/v1`` prefix to OpenClaw, so strip
     # that prefix before appending an endpoint whenever the provider root
     # already owns a path (for example Z.AI's ``/api/coding/paas/v4``).
     # Preserve it only for origin-only bases such as ``https://api.example``.
-    if urlsplit(base).path.rstrip("/") and path.startswith("/v1/"):
+    if (
+        provider_transport == "openai-completions"
+        and urlsplit(base).path.rstrip("/")
+        and path.startswith("/v1/")
+    ):
         path = path[3:]
     return f"{base}/{path.lstrip('/')}"
 
 
 class OpenClawModelBudgetProxy(AbstractContextManager["OpenClawModelBudgetProxy"]):
-    def __init__(self, *, target_base_url: str, max_completions: int, evidence_path: Path):
+    def __init__(
+        self,
+        *,
+        target_base_url: str,
+        max_completions: int,
+        evidence_path: Path,
+        provider_transport: str = "openai-completions",
+    ):
         if max_completions <= 0:
             raise ValueError("max_completions must be positive")
         parsed = urlsplit(target_base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("target_base_url must be an HTTP(S) URL")
+        if provider_transport not in _PROVIDER_TRANSPORTS:
+            raise ValueError(
+                "provider_transport must be openai-completions or "
+                "anthropic-messages"
+            )
         self.target_base_url = target_base_url
+        self.provider_transport = provider_transport
         self.max_completions = max_completions
         self.evidence_path = Path(evidence_path)
         self.completion_count = 0
@@ -63,7 +87,10 @@ class OpenClawModelBudgetProxy(AbstractContextManager["OpenClawModelBudgetProxy"
     def base_url(self) -> str:
         if self._server is None:
             raise RuntimeError("proxy is not running")
-        return f"http://127.0.0.1:{self._server.server_address[1]}/v1"
+        origin = f"http://127.0.0.1:{self._server.server_address[1]}"
+        if self.provider_transport == "anthropic-messages":
+            return origin
+        return f"{origin}/v1"
 
     def _record(self, path: str, decision: str) -> None:
         self.requests.append({"path": path.split("?", 1)[0], "decision": decision,
@@ -72,9 +99,13 @@ class OpenClawModelBudgetProxy(AbstractContextManager["OpenClawModelBudgetProxy"
         self._write_evidence()
 
     def _reserve(self, path: str) -> bool:
-        is_completion = path.split("?", 1)[0].rstrip("/").endswith(
-            ("/chat/completions", "/responses")
-        )
+        normalized_path = path.split("?", 1)[0].rstrip("/")
+        if self.provider_transport == "anthropic-messages":
+            is_completion = normalized_path == "/v1/messages"
+        else:
+            is_completion = normalized_path.endswith(
+                ("/chat/completions", "/responses")
+            )
         with self._lock:
             if not is_completion:
                 self._record(path, "forward_non_completion")
@@ -91,6 +122,7 @@ class OpenClawModelBudgetProxy(AbstractContextManager["OpenClawModelBudgetProxy"
         self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "target_origin": urlsplit(self.target_base_url)._replace(path="", query="", fragment="").geturl(),
+            "provider_transport": self.provider_transport,
             "max_completions": self.max_completions,
             "completion_count": self.completion_count,
             "rejected_count": self.rejected_count,
@@ -124,10 +156,20 @@ class OpenClawModelBudgetProxy(AbstractContextManager["OpenClawModelBudgetProxy"
                 body = self.rfile.read(length) if length else b""
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP_HEADERS}
                 try:
-                    with httpx.stream("POST", _target_url(owner.target_base_url, self.path),
-                                      content=body, headers=headers,
-                                      timeout=httpx.Timeout(connect=30, read=None, write=30, pool=30),
-                                      trust_env=False) as upstream:
+                    with httpx.stream(
+                        "POST",
+                        _target_url(
+                            owner.target_base_url,
+                            self.path,
+                            owner.provider_transport,
+                        ),
+                        content=body,
+                        headers=headers,
+                        timeout=httpx.Timeout(
+                            connect=30, read=None, write=30, pool=30
+                        ),
+                        trust_env=False,
+                    ) as upstream:
                         self.send_response(upstream.status_code)
                         has_length = False
                         for key, value in upstream.headers.items():

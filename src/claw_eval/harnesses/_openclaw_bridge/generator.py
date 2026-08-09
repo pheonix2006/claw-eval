@@ -442,6 +442,7 @@ def _render_one_tool(
           errMsg = e instanceof Error ? e.message : String(e);
           body = {{ error: errMsg }};
         }}
+        const finished = Date.now();
         recordCall({{
           toolCallId: ctx?.toolCallId ?? null,
           tool: {_js_string(tool_name)},
@@ -450,7 +451,9 @@ def _render_one_tool(
           request: params,
           status,
           response: body,
-          durationMs: Date.now() - started,
+          startedAtMs: started,
+          finishedAtMs: finished,
+          durationMs: finished - started,
           ...(errMsg ? {{ error: errMsg }} : {{}}),
         }});
         return body;
@@ -540,6 +543,7 @@ def _render_media_tool(
             errMsg = e instanceof Error ? e.message : String(e);
             body = {{ error: errMsg }};
           }}
+          const finished = Date.now();
           recordCall({{
             toolCallId: toolCallId ?? null,
             tool: {_js_string(tool_name)},
@@ -548,7 +552,9 @@ def _render_media_tool(
             request: params,
             status,
             response: body,
-            durationMs: Date.now() - started,
+            startedAtMs: started,
+            finishedAtMs: finished,
+            durationMs: finished - started,
             ...(errMsg ? {{ error: errMsg }} : {{}}),
           }});
           // Expand frames[] into native image content blocks so the multimodal

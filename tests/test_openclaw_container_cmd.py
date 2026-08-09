@@ -45,3 +45,26 @@ def test_cmd_threads_session_key_when_given() -> None:
 def test_cmd_no_timeout_when_nonpositive() -> None:
     cmd = _build_agent_cmd(prompt="x", agent_id="main", timeout_s=0)
     assert "--timeout" not in cmd
+
+
+def test_cmd_materializes_explicit_medium_without_binary_on() -> None:
+    cmd = _build_agent_cmd(
+        prompt="x",
+        agent_id="main",
+        timeout_s=600,
+        thinking=True,
+        reasoning_effort="medium",
+    )
+    assert cmd[cmd.index("--thinking") + 1] == "medium"
+    assert cmd.count("--thinking") == 1
+
+
+def test_cmd_materializes_explicit_off() -> None:
+    cmd = _build_agent_cmd(
+        prompt="x",
+        agent_id="main",
+        timeout_s=600,
+        thinking=False,
+        reasoning_effort="off",
+    )
+    assert cmd[cmd.index("--thinking") + 1] == "off"

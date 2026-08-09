@@ -566,6 +566,7 @@ class OpenClawHarness:
                 target_base_url=cfg.model.base_url,
                 max_completions=int(task.environment.max_turns),
                 evidence_path=raw_dir / "model_budget.json",
+                provider_transport=cfg.model.provider_transport,
             ) as model_budget:
                 def run_turn(message: str, session_key: "str | None") -> dict:
                     remaining = max(1.0, deadline - time.monotonic())
@@ -579,9 +580,18 @@ class OpenClawHarness:
                             "baseUrl": model_budget.base_url,
                             "model": cfg.model.model_id,
                             "apiKey": cfg.model.api_key,
-                            "provider_type": "openai",
+                            "provider_type": (
+                                "anthropic"
+                                if cfg.model.provider_transport
+                                == "anthropic-messages"
+                                else "openai"
+                            ),
+                            "provider_api": cfg.model.provider_transport,
                             "thinking": bool(getattr(cfg.model, "thinking", False)),
+                            "reasoning": bool(getattr(cfg.model, "reasoning", False)),
                             "thinking_format": getattr(cfg.model, "thinking_format", None),
+                            "reasoning_effort": getattr(cfg.model, "reasoning_effort", None),
+                            "input_modalities": list(cfg.model.input_modalities),
                             "context_window": int(cfg.model.context_window),
                             "max_tokens": getattr(cfg.model, "max_tokens", None),
                         },
@@ -821,9 +831,17 @@ class OpenClawHarness:
                         "baseUrl": cfg.model.base_url,
                         "model": cfg.model.model_id,
                         "apiKey": cfg.model.api_key,
-                        "provider_type": "openai",
+                        "provider_type": (
+                            "anthropic"
+                            if cfg.model.provider_transport == "anthropic-messages"
+                            else "openai"
+                        ),
+                        "provider_api": cfg.model.provider_transport,
                         "thinking": bool(getattr(cfg.model, "thinking", False)),
+                        "reasoning": bool(getattr(cfg.model, "reasoning", False)),
                         "thinking_format": getattr(cfg.model, "thinking_format", None),
+                        "reasoning_effort": getattr(cfg.model, "reasoning_effort", None),
+                        "input_modalities": list(cfg.model.input_modalities),
                         "context_window": int(cfg.model.context_window),
                         "max_tokens": getattr(cfg.model, "max_tokens", None),
                     },

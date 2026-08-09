@@ -46,9 +46,11 @@ from typing import Any, Dict, List, Optional
 
 from ._openclaw_native import (
     _build_openclaw_temp_config,
+    _attest_reasoning_effort,
     _extract_openclaw_trace,
     _find_latest_session,
     _json_first_value,
+    _normalize_reasoning_effort,
     _outputs_from_openclaw_result,
     _safe_json_loads,
 )
@@ -95,6 +97,7 @@ def _build_agent_cmd(
     timeout_s: float,
     session_key: Optional[str] = None,
     thinking: bool = False,
+    reasoning_effort: Optional[str] = None,
 ) -> "list[str]":
     """Build the ``openclaw agent`` argv for a single in-container turn.
 
@@ -111,7 +114,10 @@ def _build_agent_cmd(
     ]
     if session_key:
         cmd.extend(["--session-key", str(session_key)])
-    if thinking:
+    reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    if reasoning_effort is not None:
+        cmd.extend(["--thinking", reasoning_effort])
+    elif thinking:
         cmd.extend(["--thinking", "on"])
     if isinstance(timeout_s, (int, float)) and timeout_s > 0:
         cmd.extend(["--timeout", str(int(timeout_s))])
@@ -156,7 +162,7 @@ def run_in_container(
         Wall-clock cap; OpenClaw's ``--timeout`` flag mirrors this and the
         docker exec timeout is set slightly above it.
     api_provider:
-        ``{"baseUrl", "model", "apiKey", "provider_type"}``.
+        ``{"baseUrl", "model", "apiKey", "provider_type", "provider_api"}``.
     extra_plugins:
         Plugin ids to surface in ``CLAWEVAL_EXTRA_PLUGINS`` (exposed to the
         OpenClaw subprocess via env var; today informational only since
@@ -194,9 +200,19 @@ def run_in_container(
     model = api_provider.get("model") if isinstance(api_provider, dict) else None
     api_key = api_provider.get("apiKey") if isinstance(api_provider, dict) else None
     thinking = bool(api_provider.get("thinking")) if isinstance(api_provider, dict) else False
+    reasoning = bool(api_provider.get("reasoning")) if isinstance(api_provider, dict) else False
     thinking_format = api_provider.get("thinking_format") if isinstance(api_provider, dict) else None
+    reasoning_effort = _normalize_reasoning_effort(
+        api_provider.get("reasoning_effort") if isinstance(api_provider, dict) else None
+    )
+    provider_api = (
+        str(api_provider.get("provider_api") or "openai-completions")
+        if isinstance(api_provider, dict)
+        else "openai-completions"
+    )
     context_window = api_provider.get("context_window") if isinstance(api_provider, dict) else None
     max_tokens = api_provider.get("max_tokens") if isinstance(api_provider, dict) else None
+    input_modalities = api_provider.get("input_modalities") if isinstance(api_provider, dict) else None
     provider_id = (
         str(api_provider.get("provider_type") or "openai")
         if isinstance(api_provider, dict)
@@ -204,7 +220,11 @@ def run_in_container(
     )
     # thinking on 时归一 provider id 为 "vllm"（openclaw 的 --thinking gate
     # isVllmQwenThinkingCompat 只认 vllm；对齐外层 OpenClawRuntime 做法）。
-    if thinking:
+    if (
+        thinking
+        and provider_api == "openai-completions"
+        and reasoning_effort is None
+    ):
         provider_id = "vllm"
 
     resolved_agent_id = str(agent_id or "").strip() or "main"
@@ -218,44 +238,50 @@ def run_in_container(
         else os.path.join(raw_dir_host, "openclaw.json")
     )
     if isinstance(base_url, str) and base_url.strip() and isinstance(model, str) and model.strip():
+        prev_cfg_env = os.environ.get("OPENCLAW_CONFIG_PATH")
+        os.environ["OPENCLAW_CONFIG_PATH"] = config_path_host
         try:
-            prev_cfg_env = os.environ.get("OPENCLAW_CONFIG_PATH")
-            os.environ["OPENCLAW_CONFIG_PATH"] = config_path_host
-            try:
-                _build_openclaw_temp_config(
-                    dst_path=config_path_host,
-                    provider_id=provider_id,
-                    target_base_url=base_url.strip(),
-                    target_model=model.strip(),
-                    target_api_key=api_key.strip() if isinstance(api_key, str) and api_key.strip() else None,
-                    workspace_dir=os.path.abspath(work_dir_host),
-                    thinking=thinking,
-                    thinking_format=thinking_format,
-                    context_window=(
-                        context_window
-                        if isinstance(context_window, int) and not isinstance(context_window, bool)
-                        else None
-                    ),
-                    max_tokens=(
-                        max_tokens
-                        if isinstance(max_tokens, int) and not isinstance(max_tokens, bool)
-                        else None
-                    ),
-                    provider_timeout_sec=(
-                        int(timeout_s)
-                        if isinstance(timeout_s, (int, float))
-                        and not isinstance(timeout_s, bool)
-                        and timeout_s > 0
-                        else None
-                    ),
-                )
-            finally:
-                if prev_cfg_env is None:
-                    os.environ.pop("OPENCLAW_CONFIG_PATH", None)
-                else:
-                    os.environ["OPENCLAW_CONFIG_PATH"] = prev_cfg_env
-        except Exception as exc:
-            _log.warning("openclaw config build failed: %s", exc)
+            _build_openclaw_temp_config(
+                dst_path=config_path_host,
+                provider_id=provider_id,
+                target_base_url=base_url.strip(),
+                target_model=model.strip(),
+                target_api_key=(
+                    api_key.strip()
+                    if isinstance(api_key, str) and api_key.strip()
+                    else None
+                ),
+                workspace_dir=os.path.abspath(work_dir_host),
+                provider_api=provider_api,
+                thinking=thinking,
+                reasoning=reasoning,
+                thinking_format=thinking_format,
+                reasoning_effort=reasoning_effort,
+                input_modalities=input_modalities,
+                context_window=(
+                    context_window
+                    if isinstance(context_window, int)
+                    and not isinstance(context_window, bool)
+                    else None
+                ),
+                max_tokens=(
+                    max_tokens
+                    if isinstance(max_tokens, int) and not isinstance(max_tokens, bool)
+                    else None
+                ),
+                provider_timeout_sec=(
+                    int(timeout_s)
+                    if isinstance(timeout_s, (int, float))
+                    and not isinstance(timeout_s, bool)
+                    and timeout_s > 0
+                    else None
+                ),
+            )
+        finally:
+            if prev_cfg_env is None:
+                os.environ.pop("OPENCLAW_CONFIG_PATH", None)
+            else:
+                os.environ["OPENCLAW_CONFIG_PATH"] = prev_cfg_env
 
     # Env vars to pass into docker exec. The OpenClaw subprocess uses these
     # to find the isolated state dir + models config.
@@ -265,12 +291,20 @@ def run_in_container(
         "HOME": case_home,
         "OPENCLAW_CONFIG_PATH": config_path_host,
     }
-    if isinstance(base_url, str) and base_url.strip():
-        container_env["OPENAI_BASE_URL"] = base_url.strip()
-    if isinstance(model, str) and model.strip():
-        container_env["OPENAI_MODEL"] = model.strip()
-    if isinstance(api_key, str) and api_key.strip():
-        container_env["OPENAI_API_KEY"] = api_key.strip()
+    if provider_api == "anthropic-messages":
+        if isinstance(base_url, str) and base_url.strip():
+            container_env["ANTHROPIC_BASE_URL"] = base_url.strip()
+        if isinstance(model, str) and model.strip():
+            container_env["ANTHROPIC_MODEL"] = model.strip()
+        if isinstance(api_key, str) and api_key.strip():
+            container_env["ANTHROPIC_API_KEY"] = api_key.strip()
+    else:
+        if isinstance(base_url, str) and base_url.strip():
+            container_env["OPENAI_BASE_URL"] = base_url.strip()
+        if isinstance(model, str) and model.strip():
+            container_env["OPENAI_MODEL"] = model.strip()
+        if isinstance(api_key, str) and api_key.strip():
+            container_env["OPENAI_API_KEY"] = api_key.strip()
     extra_plugin_ids = [
         str(p).strip() for p in (extra_plugins or []) if str(p or "").strip()
     ]
@@ -285,8 +319,11 @@ def run_in_container(
         "cwd": os.path.abspath(work_dir_host),
         "stateDir": container_env["OPENCLAW_STATE_DIR"],
         "configPath": container_env.get("OPENCLAW_CONFIG_PATH"),
-        "envModel": container_env.get("OPENAI_MODEL"),
-        "envBaseUrl": container_env.get("OPENAI_BASE_URL"),
+        "providerApi": provider_api,
+        "envModel": container_env.get("ANTHROPIC_MODEL")
+        or container_env.get("OPENAI_MODEL"),
+        "envBaseUrl": container_env.get("ANTHROPIC_BASE_URL")
+        or container_env.get("OPENAI_BASE_URL"),
         "commands": {},
     }
     diag_commands = {
@@ -323,6 +360,7 @@ def run_in_container(
         timeout_s=timeout_s,
         session_key=session_key,
         thinking=thinking,
+        reasoning_effort=reasoning_effort,
     )
 
     # docker exec needs a slightly bigger timeout than OpenClaw's own
@@ -365,6 +403,15 @@ def run_in_container(
                 "startedAt": started_at,
                 "finishedAt": time.time(),
                 "containerId": container.id if hasattr(container, "id") else None,
+                "reasoningEffort": {
+                    "requested": reasoning_effort,
+                    "materialized": reasoning_effort,
+                    "transport": "agent_cli_--thinking"
+                    if reasoning_effort is not None
+                    else "legacy_binary_thinking"
+                    if thinking
+                    else "framework_default",
+                },
             }, f, ensure_ascii=False, indent=2)
         with open(os.path.join(raw_dir_host, "stdout.txt"), "w", encoding="utf-8") as f:
             f.write(stdout_text)
@@ -452,12 +499,30 @@ def run_in_container(
     if isinstance(trace_core.get("lastText"), str) and trace_core.get("lastText"):
         last_text = str(trace_core.get("lastText"))
 
+    _, reasoning_contract_error = _attest_reasoning_effort(
+        expected=reasoning_effort,
+        config_path=config_path_host,
+        invocation_path=os.path.join(raw_dir_host, "openclaw_invocation.json"),
+        session_jsonl_path=session_jsonl,
+        terminal_status=status,
+    )
+    if reasoning_contract_error is not None:
+        status = "error"
+
     return {
         "status": status,
         "paths": outs,
         "errorMessage": (
-            f"Timeout after {timeout_s}s" if status == "timeout"
-            else (stderr_text[:2000] if status == "error" and isinstance(stderr_text, str) else None)
+            reasoning_contract_error
+            or (
+                f"Timeout after {timeout_s}s"
+                if status == "timeout"
+                else (
+                    stderr_text[:2000]
+                    if status == "error" and isinstance(stderr_text, str)
+                    else None
+                )
+            )
         ),
         "trace": {
             "runner": "openclaw",

@@ -139,6 +139,20 @@ def _require_harness_ok(result) -> None:
     )
 
 
+def _require_provider_transport(cfg, args: argparse.Namespace) -> None:
+    """Fail before rollout if CLI and config disagree on the model wire."""
+
+    requested = getattr(args, "provider_transport", None)
+    if requested is None:
+        return
+    configured = str(cfg.model.provider_transport)
+    if requested != configured:
+        raise RuntimeError(
+            "provider transport mismatch: "
+            f"CLI requested {requested!r}, config materialized {configured!r}"
+        )
+
+
 def _grade_with_optional_params(
     grader, messages, dispatches, task,
     *, audit_data, judge, media_events, env_snapshot=None,
@@ -423,6 +437,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     from .trace.reader import load_trace
 
     cfg = load_config(args.config)
+    _require_provider_transport(cfg, args)
     harness = get_harness(args.harness)
 
     task_yaml = _resolve_task_yaml(args.task)
@@ -763,6 +778,7 @@ def cmd_run_inner(args: argparse.Namespace) -> None:
     from .trace.reader import load_trace
 
     cfg = load_config(args.config)
+    _require_provider_transport(cfg, args)
     harness = get_harness(args.harness)
 
     task_yaml = _resolve_task_yaml(args.task)
@@ -1907,6 +1923,12 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--model", default=None, help="Model ID (default: from config.yaml)")
     p_run.add_argument("--api-key", default=None, help="API key (default: from config.yaml / $OPENAI_API_KEY)")
     p_run.add_argument("--base-url", default=None, help="Base URL for OpenAI-compatible API")
+    p_run.add_argument(
+        "--provider-transport",
+        choices=["openai-completions", "anthropic-messages"],
+        default=None,
+        help="Required model wire; must match config.model.provider_transport",
+    )
     p_run.add_argument("--config", default=None, help="Path to config.yaml")
     p_run.add_argument("--trials", type=int, default=1, help="Number of trials")
     p_run.add_argument("--trace-dir", default=None, help="Output directory for traces")
@@ -1928,6 +1950,11 @@ def main(argv: list[str] | None = None) -> None:
     p_inner.add_argument("--model", default=None)
     p_inner.add_argument("--api-key", default=None)
     p_inner.add_argument("--base-url", default=None)
+    p_inner.add_argument(
+        "--provider-transport",
+        choices=["openai-completions", "anthropic-messages"],
+        default=None,
+    )
     p_inner.add_argument("--config", default=None)
     p_inner.add_argument("--trace-dir", default=None)
     p_inner.add_argument("--sandbox-tools", action="store_true")
