@@ -8,7 +8,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from ._openclaw_media import (
+    build_media_agent_command,
+    resolve_openclaw_package_root,
+)
 
 Json = Any
 
@@ -181,9 +187,152 @@ def _capture_openclaw_preflight(*, env: Dict[str, str], cwd: str, out_path: str)
 
 
 _ALLOWED_INPUT_MODALITIES = ("text", "image", "audio", "video", "document")
+_ALLOWED_PROVIDER_APIS = ("openai-completions", "anthropic-messages")
+_ALLOWED_REASONING_EFFORTS = ("off", "low", "medium", "high")
 
 
-def _resolve_model_input_modalities() -> list[str]:
+def _normalize_reasoning_effort(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized not in _ALLOWED_REASONING_EFFORTS:
+        raise ValueError(
+            "OpenClaw reasoning_effort must be one of "
+            f"{_ALLOWED_REASONING_EFFORTS}, got {value!r}"
+        )
+    return normalized
+
+
+def _attest_reasoning_effort(
+    *,
+    expected: object,
+    config_path: str,
+    invocation_path: str,
+    session_jsonl_path: Optional[str],
+    terminal_status: str,
+) -> Tuple[Dict[str, Json], Optional[str]]:
+    """Cross-check explicit OpenClaw effort at config/CLI/session layers."""
+
+    normalized = _normalize_reasoning_effort(expected)
+    evidence: Dict[str, Json] = {
+        "requested": normalized,
+        "mapped": normalized,
+        "materialized": None,
+        "transcriptObserved": None,
+        "transport": "agent_cli_--thinking",
+        "configThinkingDefault": None,
+        "cliThinkingValues": [],
+        "sessionThinkingLevels": [],
+        "attestation": {"status": "not_requested"},
+    }
+    if normalized is None:
+        return evidence, None
+
+    errors: List[str] = []
+    try:
+        config = _read_json(config_path)
+    except Exception as exc:
+        config = {}
+        errors.append(f"cannot read OpenClaw config: {exc}")
+    defaults = (
+        config.get("agents", {}).get("defaults", {})
+        if isinstance(config, dict)
+        else {}
+    )
+    config_level = (
+        defaults.get("thinkingDefault") if isinstance(defaults, dict) else None
+    )
+    evidence["configThinkingDefault"] = config_level
+    if config_level != normalized:
+        errors.append(
+            "OpenClaw agents.defaults.thinkingDefault mismatch: "
+            f"expected {normalized!r}, observed {config_level!r}"
+        )
+
+    try:
+        invocation = _read_json(invocation_path)
+    except Exception as exc:
+        invocation = {}
+        errors.append(f"cannot read OpenClaw invocation: {exc}")
+    cmd = invocation.get("cmd") if isinstance(invocation, dict) else None
+    cli_values: List[str] = []
+    if isinstance(cmd, list):
+        for index, value in enumerate(cmd[:-1]):
+            if value == "--thinking":
+                cli_values.append(str(cmd[index + 1]))
+    evidence["cliThinkingValues"] = cli_values
+    if cli_values != [normalized]:
+        errors.append(
+            "OpenClaw CLI --thinking mismatch: "
+            f"expected {[normalized]!r}, observed {cli_values!r}"
+        )
+    else:
+        evidence["materialized"] = normalized
+
+    session_levels: List[str] = []
+    if session_jsonl_path and os.path.isfile(session_jsonl_path):
+        try:
+            with open(session_jsonl_path, "r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        event = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        isinstance(event, dict)
+                        and event.get("type") == "thinking_level_change"
+                        and isinstance(event.get("thinkingLevel"), str)
+                    ):
+                        session_levels.append(str(event["thinkingLevel"]))
+        except OSError as exc:
+            errors.append(f"cannot read OpenClaw session evidence: {exc}")
+    evidence["sessionThinkingLevels"] = session_levels
+    if session_levels and set(session_levels) == {normalized}:
+        evidence["transcriptObserved"] = normalized
+    elif terminal_status == "ok":
+        errors.append(
+            "OpenClaw session thinking level mismatch: "
+            f"expected only {normalized!r}, observed {session_levels!r}"
+        )
+
+    evidence["attestation"] = {
+        "status": "error" if errors else "ok",
+        "errors": errors,
+    }
+    if isinstance(invocation, dict):
+        invocation["reasoningEffort"] = evidence
+        try:
+            _write_json(invocation_path, invocation)
+        except Exception as exc:
+            errors.append(f"cannot persist reasoning effort attestation: {exc}")
+            evidence["attestation"] = {"status": "error", "errors": errors}
+
+    return evidence, "; ".join(errors) if errors else None
+
+
+def _normalize_model_input_modalities(
+    values: Sequence[object], *, source: str
+) -> list[str]:
+    if isinstance(values, (str, bytes)) or not values:
+        raise ValueError(f"{source} must be a non-empty sequence")
+    seen: list[str] = []
+    for value in values:
+        modality = str(value or "").strip().lower()
+        if modality not in _ALLOWED_INPUT_MODALITIES:
+            raise ValueError(
+                f"{source} contains unsupported modality {value!r}; "
+                f"expected one of {_ALLOWED_INPUT_MODALITIES}"
+            )
+        if modality not in seen:
+            seen.append(modality)
+    return seen
+
+
+def _resolve_model_input_modalities(
+    declared: Optional[Sequence[object]] = None,
+) -> list[str]:
     """Input modalities to declare on the OpenClaw model entry.
 
     OpenClaw gates whether image/video content blocks are sent to the model on
@@ -194,15 +343,31 @@ def _resolve_model_input_modalities() -> list[str]:
     is GLM-5V), so default to declaring image/video support; allow override via
     ``CLAWEVAL_MODEL_INPUT_MODALITIES`` (comma-separated) for text-only models.
     """
+    explicit = (
+        _normalize_model_input_modalities(
+            declared, source="ClawEval model.input_modalities"
+        )
+        if declared is not None
+        else None
+    )
     raw = os.environ.get("CLAWEVAL_MODEL_INPUT_MODALITIES")
-    if raw is None or not raw.strip():
-        return ["text", "image", "video"]
-    seen: list[str] = []
-    for tok in raw.split(","):
-        m = tok.strip().lower()
-        if m in _ALLOWED_INPUT_MODALITIES and m not in seen:
-            seen.append(m)
-    return seen or ["text"]
+    from_env = None
+    if raw is not None:
+        if not raw.strip():
+            raise ValueError("CLAWEVAL_MODEL_INPUT_MODALITIES must not be empty")
+        from_env = _normalize_model_input_modalities(
+            raw.split(","), source="CLAWEVAL_MODEL_INPUT_MODALITIES"
+        )
+    if explicit is not None and from_env is not None and explicit != from_env:
+        raise ValueError(
+            "model input modality mismatch: "
+            f"config={explicit!r} env={from_env!r}"
+        )
+    if explicit is not None:
+        return explicit
+    if from_env is not None:
+        return from_env
+    return ["text", "image", "video"]
 
 
 def _build_openclaw_temp_config(
@@ -213,8 +378,26 @@ def _build_openclaw_temp_config(
     target_model: str,
     target_api_key: Optional[str],
     workspace_dir: str,
+    provider_api: str = "openai-completions",
     thinking: bool = False,
+    reasoning: bool = False,
+    thinking_format: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    input_modalities: Optional[Sequence[object]] = None,
+    context_window: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    provider_timeout_sec: Optional[int] = None,
 ) -> str:
+    reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    if provider_api not in _ALLOWED_PROVIDER_APIS:
+        raise ValueError(
+            "unsupported OpenClaw provider_api: "
+            f"{provider_api}; expected one of {_ALLOWED_PROVIDER_APIS}"
+        )
+    if provider_api == "anthropic-messages" and thinking_format is not None:
+        raise ValueError(
+            "Anthropic Messages transport must not set OpenAI thinking_format"
+        )
     src_path = os.environ.get("OPENCLAW_CONFIG_PATH") or os.path.expanduser("~/.openclaw/openclaw.json")
     cfg: Dict[str, Json] = {}
     try:
@@ -235,22 +418,46 @@ def _build_openclaw_temp_config(
     if not isinstance(provider_cfg, dict):
         provider_cfg = {}
     provider_cfg["baseUrl"] = target_base_url
-    provider_cfg["api"] = "openai-completions"
+    provider_cfg["api"] = provider_api
     if isinstance(target_api_key, str) and target_api_key:
         provider_cfg["apiKey"] = target_api_key
+    if (
+        isinstance(provider_timeout_sec, int)
+        and not isinstance(provider_timeout_sec, bool)
+        and provider_timeout_sec > 0
+    ):
+        provider_cfg["timeoutSeconds"] = provider_timeout_sec
+    resolved_input_modalities = _resolve_model_input_modalities(input_modalities)
     model_entry = {
         "id": target_model,
         "name": target_model,
-        "api": "openai-completions",
-        "input": _resolve_model_input_modalities(),
+        "api": provider_api,
+        "input": resolved_input_modalities,
     }
-    if thinking:
-        # 对齐外层 OpenClawRuntime：openai-completions transport 只在 reasoning + qwen 格式下发 enable_thinking
+    if isinstance(context_window, int) and not isinstance(context_window, bool) and context_window > 0:
+        model_entry["contextWindow"] = context_window
+    if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0:
+        model_entry["maxTokens"] = max_tokens
+    if thinking or reasoning:
         model_entry["reasoning"] = True
-        model_entry["compat"] = {"thinkingFormat": "qwen"}
+    if (
+        thinking
+        and provider_api == "openai-completions"
+        and reasoning_effort is None
+    ):
+        if thinking_format not in (None, "qwen-chat-template", "deepseek"):
+            raise ValueError(f"unsupported OpenClaw thinking_format: {thinking_format}")
+        model_entry["compat"] = {
+            "thinkingFormat": thinking_format or "qwen"
+        }
     provider_cfg["models"] = [model_entry]
     providers[provider_id] = provider_cfg
     models["providers"] = providers
+    if context_window is not None or max_tokens is not None:
+        # The explicit entry owns the evaluated context/output contract.
+        # Merge mode can silently replace it with a larger value discovered
+        # from the self-hosted endpoint and defeat the estimator guard.
+        models["mode"] = "replace"
     cfg["models"] = models
 
     agents = cfg.get("agents")
@@ -266,6 +473,8 @@ def _build_openclaw_temp_config(
     model_cfg["primary"] = model_ref
     defaults["model"] = model_cfg
     defaults["workspace"] = os.path.abspath(workspace_dir)
+    if reasoning_effort is not None:
+        defaults["thinkingDefault"] = reasoning_effort
     allowed_models = defaults.get("models")
     if not isinstance(allowed_models, dict):
         allowed_models = {}
@@ -279,6 +488,21 @@ def _build_openclaw_temp_config(
     cfg["agents"] = agents
 
     _write_json(dst_path, cfg)
+    materialized = _read_json(dst_path)
+    materialized_input = (
+        materialized.get("models", {})
+        .get("providers", {})
+        .get(provider_id, {})
+        .get("models", [{}])[0]
+        .get("input")
+        if isinstance(materialized, dict)
+        else None
+    )
+    if materialized_input != resolved_input_modalities:
+        raise RuntimeError(
+            "OpenClaw model catalog input modality drift: "
+            f"expected={resolved_input_modalities!r} actual={materialized_input!r}"
+        )
     return dst_path
 
 
@@ -883,6 +1107,7 @@ def _extract_openclaw_trace(*, session_jsonl_path: str, base_url: Optional[str],
                     model = str(msg.get("model"))
                 content = msg.get("content")
                 text_parts: List[str] = []
+                tool_events: List[Json] = []
                 if isinstance(content, list):
                     for c in content:
                         if not isinstance(c, dict):
@@ -907,7 +1132,7 @@ def _extract_openclaw_trace(*, session_jsonl_path: str, base_url: Optional[str],
                                     "output": None,
                                     "exitCode": None,
                                 }
-                                execution_trace.append(ev)
+                                tool_events.append(ev)
                                 tool_index[tcid] = ev
                 text = "\n".join([t for t in text_parts if t]).strip()
                 if text:
@@ -931,6 +1156,10 @@ def _extract_openclaw_trace(*, session_jsonl_path: str, base_url: Optional[str],
                         },
                     }
                 )
+                # Keep the assistant message before its tool calls. The trace
+                # adapter attaches each ToolUseBlock to the most recent
+                # assistant message and native ClawEval uses the same order.
+                execution_trace.extend(tool_events)
                 continue
 
             if role == "toolResult":
@@ -978,6 +1207,7 @@ def run(
     api_provider: Dict[str, Json],
     agent_id: Optional[str] = None,
     extra_plugins: Optional[List[str]] = None,
+    images: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Json]:
     started_at = time.time()
     _ensure_dir(sandbox_dir)
@@ -1010,12 +1240,20 @@ def run(
     env["OPENCLAW_HOME"] = case_home
     config_path = os.path.join(raw_dir, "openclaw.json")
     provider_id = str(api_provider.get("provider_type") or "openai") if isinstance(api_provider, dict) else "openai"
+    provider_api = str(api_provider.get("provider_api") or "openai-completions") if isinstance(api_provider, dict) else "openai-completions"
     fetch_hook_path = os.path.join(raw_dir, "openclaw_fetch_hook.mjs")
     fetch_log_path = os.path.join(raw_dir, "openclaw_fetch_log.jsonl")
 
     base_url = api_provider.get("baseUrl") if isinstance(api_provider, dict) else None
     model = api_provider.get("model") if isinstance(api_provider, dict) else None
     api_key = api_provider.get("apiKey") if isinstance(api_provider, dict) else None
+    context_window = api_provider.get("context_window") if isinstance(api_provider, dict) else None
+    max_tokens = api_provider.get("max_tokens") if isinstance(api_provider, dict) else None
+    thinking_format = api_provider.get("thinking_format") if isinstance(api_provider, dict) else None
+    input_modalities = api_provider.get("input_modalities") if isinstance(api_provider, dict) else None
+    reasoning_effort = _normalize_reasoning_effort(
+        api_provider.get("reasoning_effort") if isinstance(api_provider, dict) else None
+    )
     proxy_server = None
     proxy_thread = None
     proxy_url = None
@@ -1050,29 +1288,95 @@ def run(
     except Exception:
         fetch_hook_path = ""
         fetch_log_path = ""
-    if isinstance(base_url, str) and base_url.strip():
-        env["OPENAI_BASE_URL"] = proxy_url or base_url.strip()
-    if isinstance(model, str) and model.strip():
-        env["OPENAI_MODEL"] = model.strip()
-    if isinstance(api_key, str) and api_key.strip():
-        env["OPENAI_API_KEY"] = api_key.strip()
+    if provider_api == "anthropic-messages":
+        if isinstance(base_url, str) and base_url.strip():
+            env["ANTHROPIC_BASE_URL"] = proxy_url or base_url.strip()
+        if isinstance(model, str) and model.strip():
+            env["ANTHROPIC_MODEL"] = model.strip()
+        if isinstance(api_key, str) and api_key.strip():
+            env["ANTHROPIC_API_KEY"] = api_key.strip()
+    else:
+        if isinstance(base_url, str) and base_url.strip():
+            env["OPENAI_BASE_URL"] = proxy_url or base_url.strip()
+        if isinstance(model, str) and model.strip():
+            env["OPENAI_MODEL"] = model.strip()
+        if isinstance(api_key, str) and api_key.strip():
+            env["OPENAI_API_KEY"] = api_key.strip()
 
-    cmd = ["openclaw", "agent", "--local", "--json", "--message", prompt, "--agent", str(resolved_agent_id)]
-    if isinstance(timeout_s, (int, float)) and timeout_s > 0:
-        cmd.extend(["--timeout", str(int(timeout_s))])
+    cmd = (
+        build_media_agent_command(
+            raw_dir=Path(raw_dir),
+            openclaw_package_root=resolve_openclaw_package_root(env),
+            message=prompt,
+            agent_id=str(resolved_agent_id),
+            images=images,
+            timeout_s=timeout_s,
+            thinking=bool(api_provider.get("thinking")),
+            reasoning_effort=reasoning_effort,
+        )
+        if images
+        else [
+            "openclaw",
+            "agent",
+            "--local",
+            "--json",
+            "--message",
+            prompt,
+            "--agent",
+            str(resolved_agent_id),
+        ]
+    )
+    if not images:
+        if reasoning_effort is not None:
+            cmd.extend(["--thinking", reasoning_effort])
+        if isinstance(timeout_s, (int, float)) and timeout_s > 0:
+            cmd.extend(["--timeout", str(int(timeout_s))])
 
     if isinstance(base_url, str) and base_url.strip() and isinstance(model, str) and model.strip():
-        try:
-            env["OPENCLAW_CONFIG_PATH"] = _build_openclaw_temp_config(
-                dst_path=config_path,
-                provider_id=provider_id,
-                target_base_url=(proxy_url or base_url.strip()),
-                target_model=model.strip(),
-                target_api_key=(api_key.strip() if isinstance(api_key, str) and api_key.strip() else None),
-                workspace_dir=os.path.abspath(work_dir),
-            )
-        except Exception:
-            env["OPENCLAW_CONFIG_PATH"] = config_path
+        env["OPENCLAW_CONFIG_PATH"] = _build_openclaw_temp_config(
+            dst_path=config_path,
+            provider_id=provider_id,
+            target_base_url=(proxy_url or base_url.strip()),
+            target_model=model.strip(),
+            target_api_key=(
+                api_key.strip()
+                if isinstance(api_key, str) and api_key.strip()
+                else None
+            ),
+            workspace_dir=os.path.abspath(work_dir),
+            provider_api=provider_api,
+            thinking=(
+                bool(api_provider.get("thinking"))
+                if isinstance(api_provider, dict)
+                else False
+            ),
+            reasoning=(
+                bool(api_provider.get("reasoning"))
+                if isinstance(api_provider, dict)
+                else False
+            ),
+            thinking_format=thinking_format,
+            reasoning_effort=reasoning_effort,
+            input_modalities=input_modalities,
+            context_window=(
+                context_window
+                if isinstance(context_window, int)
+                and not isinstance(context_window, bool)
+                else None
+            ),
+            max_tokens=(
+                max_tokens
+                if isinstance(max_tokens, int) and not isinstance(max_tokens, bool)
+                else None
+            ),
+            provider_timeout_sec=(
+                int(timeout_s)
+                if isinstance(timeout_s, (int, float))
+                and not isinstance(timeout_s, bool)
+                and timeout_s > 0
+                else None
+            ),
+        )
 
     #region debug-point openclaw_preflight
     try:
@@ -1088,8 +1392,13 @@ def run(
     used_timeout = timeout_s if isinstance(timeout_s, (int, float)) and timeout_s > 0 else None
     try:
         try:
+            effective_cmd = (
+                cmd
+                if images
+                else ["openclaw", "--no-color", "--log-level", "silent", *cmd[1:]]
+            )
             p = subprocess.run(
-                ["openclaw", "--no-color", "--log-level", "silent", *cmd[1:]],
+                effective_cmd,
                 cwd=os.path.abspath(work_dir),
                 env=env,
                 capture_output=True,
@@ -1149,6 +1458,13 @@ def run(
             "proxyUrl": proxy_url,
             "proxyLogPath": proxy_log_path if os.path.exists(proxy_log_path) else None,
             "patchedModelsPath": patched_models_path,
+            "reasoningEffort": {
+                "requested": reasoning_effort,
+                "materialized": reasoning_effort,
+                "transport": "agent_cli_--thinking"
+                if reasoning_effort is not None
+                else "framework_default",
+            },
         },
     )
     with open(os.path.join(raw_dir, "stdout.txt"), "w", encoding="utf-8") as f:
@@ -1210,11 +1526,22 @@ def run(
     if isinstance(trace_core.get("lastText"), str) and trace_core.get("lastText"):
         last_text = str(trace_core.get("lastText"))
 
+    _, reasoning_contract_error = _attest_reasoning_effort(
+        expected=reasoning_effort,
+        config_path=config_path,
+        invocation_path=os.path.join(raw_dir, "openclaw_invocation.json"),
+        session_jsonl_path=session_jsonl,
+        terminal_status=status,
+    )
+    if reasoning_contract_error is not None:
+        status = "error"
+
     return {
         "status": status,
         "paths": outs,
         "errorMessage": (
-            (f"Timeout after {timeout_s}s" if status == "timeout" else (stderr_text[:2000] if status == "error" and isinstance(stderr_text, str) else None))
+            reasoning_contract_error
+            or (f"Timeout after {timeout_s}s" if status == "timeout" else (stderr_text[:2000] if status == "error" and isinstance(stderr_text, str) else None))
         ),
         "trace": {
             "runner": "openclaw",

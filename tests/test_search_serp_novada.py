@@ -64,10 +64,35 @@ def test_async_extract_empty_is_not_error():
     assert out == []
 
 
+def test_async_extract_official_direct_list_with_organic_results():
+    organic = [{"title": "T", "link": "https://x", "snippet": "snip"}]
+    out, err = serp._extract_async_organic(
+        [{"spider_code": 200, "rest": {"organic_results": organic}}]
+    )
+    assert err is None
+    assert out == organic
+
+
 def test_async_extract_business_error_code():
     out, err = serp._extract_async_organic({"code": 401, "msg": "invalid key"})
     assert out == []
     assert err and "401" in err and "invalid key" in err
+
+
+def test_async_extract_inner_business_error_code():
+    out, err = serp._extract_async_organic(
+        {"code": 0, "data": {"code": 400, "msg": "serp returns empty", "data": None}}
+    )
+    assert out == []
+    assert err and "missing 'data'" in err and "serp returns empty" in err
+
+
+def test_async_extract_spider_error_code():
+    out, err = serp._extract_async_organic(
+        [{"spider_code": 503, "rest": {"organic": []}}]
+    )
+    assert out == []
+    assert err and "spider error code=503" in err
 
 
 def test_async_extract_missing_structure():

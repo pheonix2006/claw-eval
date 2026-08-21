@@ -55,6 +55,7 @@ def test_preflight_no_longer_rejects_user_agent_task() -> None:
 def test_supported_features_includes_user_agent() -> None:
     harness = get_harness("openclaw")
     assert "user_agent" in harness.supported_features
+    assert "max_turns_strict" in harness.supported_features
 
 
 def test_preflight_still_ok_for_non_user_agent() -> None:
@@ -169,6 +170,99 @@ def test_multi_turn_caps_at_max_rounds() -> None:
     assert result["done"] is False  # capped, not satisfied
 
 
+def test_multi_turn_stops_immediately_after_non_ok_turn() -> None:
+    """A failed OpenClaw turn is terminal; the simulated user must not react
+    to an error/timeout and trigger another full CLI invocation."""
+    calls: list[tuple[str, str | None]] = []
+
+    def run_turn(message: str, session_key: str | None) -> dict:
+        calls.append((message, session_key))
+        return {
+            "status": "error",
+            "errorMessage": "context overflow",
+            "trace": {"lastText": "", "executionTrace": []},
+        }
+
+    ua = _StubUserAgent(["不应被调用"])
+    result = _drive_user_agent_turns(
+        prompt="task",
+        run_turn=run_turn,
+        user_agent=ua,
+        persona="p",
+        max_rounds=8,
+        agent_id="main",
+        run_id="run1",
+    )
+
+    assert len(calls) == 1
+    assert ua.calls == []
+    assert result["terminal_status"] == "error"
+    assert result["done"] is False
+
+
+def test_multi_turn_uses_one_shared_deadline() -> None:
+    """All user-agent rounds share the task deadline instead of receiving a
+    fresh timeout.  Once the first turn + UA consume the budget, no second
+    OpenClaw invocation may start."""
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+    calls: list[tuple[str, str | None]] = []
+
+    def run_turn(message: str, session_key: str | None) -> dict:
+        calls.append((message, session_key))
+        clock.now = 90.0
+        return _raw("first answer")
+
+    class SlowUserAgent(_StubUserAgent):
+        def generate_response(self, persona, conversation_messages):
+            reply = super().generate_response(persona, conversation_messages)
+            clock.now = 101.0
+            return reply
+
+    ua = SlowUserAgent(["follow up"])
+    result = _drive_user_agent_turns(
+        prompt="task",
+        run_turn=run_turn,
+        user_agent=ua,
+        persona="p",
+        max_rounds=8,
+        agent_id="main",
+        run_id="run1",
+        deadline=100.0,
+        clock=clock,
+    )
+
+    assert len(calls) == 1
+    assert result["deadline_exhausted"] is True
+    assert result["terminal_status"] == "timeout"
+
+
+def test_user_agent_transcript_includes_original_task_prompt() -> None:
+    """Native ClawEval gives the user simulator the full conversation,
+    including the original task prompt; the OpenClaw reconstruction must too."""
+    run_turn, _ = _record_runner()
+    ua = _StubUserAgent([None])
+    _drive_user_agent_turns(
+        prompt="原始任务必须可见",
+        run_turn=run_turn,
+        user_agent=ua,
+        persona="p",
+        max_rounds=4,
+        agent_id="main",
+        run_id="r",
+    )
+
+    assert ua.calls
+    assert ua.calls[0][0].role == "user"
+    assert ua.calls[0][0].text == "原始任务必须可见"
+
+
 def test_session_key_includes_run_id() -> None:
     """session_key is per-run unique so concurrent/repeat runs don't collide."""
     run_turn, calls = _record_runner()
@@ -246,6 +340,19 @@ def test_merge_concatenates_without_duplicating_injected_marker() -> None:
     ua = [c for c in contents if str(c).startswith("[user_agent]")]
     assert len(ua) == 1, contents
     assert contents == ["原始任务", "答1", "[user_agent]\n追问1", "答2"]
+
+
+def test_merge_drops_budget_proxy_control_error() -> None:
+    accepted = {"type": "text", "role": "assistant", "content": "partial"}
+    rejected = {
+        "type": "text", "role": "assistant", "content": "",
+        "llm": {"errorMessage": "400 ClawEval max_turns exceeded",
+                "errorCode": "claw_eval_max_turns_exceeded"},
+    }
+    merged = _merge_turn_traces(
+        [_turn_with_trace([accepted, rejected])], injected=[]
+    )
+    assert merged == [accepted]
 
 
 # --------------------------------------------------------------------------- #

@@ -9,6 +9,8 @@
 //   request      — params the LLM passed in (after TypeBox validation)
 //   status       — HTTP status code from the mock service, or -1 on transport error
 //   response     — parsed JSON body, or the raw string when JSON parsing fails
+//   startedAtMs / finishedAtMs — wall-clock bounds used only for cross-worker
+//                  operational ordering and degradation supervision
 //   durationMs   — wall-clock time spent in fetch+parse
 //   error        — string, present only when fetch itself threw
 //
@@ -26,6 +28,8 @@ export interface BridgeRecord {
   request: unknown;
   status: number;
   response: unknown;
+  startedAtMs: number;
+  finishedAtMs: number;
   durationMs: number;
   error?: string;
 }

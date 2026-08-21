@@ -40,12 +40,13 @@ import json
 import logging
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 from ..models.content import TextBlock, ToolResultBlock, ToolUseBlock
 from ..models.message import Message
 from ..models.trace import (
     AuditSnapshot,
+    MediaLoad,
     TokenUsage,
     ToolDispatch,
     TraceEnd,
@@ -194,6 +195,25 @@ def _compute_is_error(
     return False
 
 
+_OPENCLAW_SANDBOX_TOOL_ALIASES = {
+    "exec": "Bash",
+    "bash": "Bash",
+    "read": "Read",
+    "write": "Write",
+    "edit": "Edit",
+}
+
+
+def _session_tool_failed(event: dict[str, Any]) -> bool:
+    if event.get("isError") is True or event.get("errorMessage"):
+        return True
+    exit_code = event.get("exitCode")
+    if isinstance(exit_code, int) and exit_code != 0:
+        return True
+    status = str(event.get("status") or "").lower()
+    return status in {"error", "failed", "fail"}
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -214,6 +234,7 @@ def translate_openclaw(
     user_agent_rounds: int = 0,
     user_agent_max_rounds: int = 0,
     user_agent_done: bool = False,
+    media_events: Sequence[dict[str, Any]] = (),
 ) -> Path:
     """Translate an OpenClaw session + bridge log into a claw-eval trace JSONL.
 
@@ -356,7 +377,25 @@ def translate_openclaw(
 
             # 2) Pair with bridge record (if any) to compute is_error.
             bridge_rec = bridge_index.get(call_id)
-            is_error = _compute_is_error(event, bridge_rec)
+            declared_names = {spec.name for spec in (task.tools or [])}
+            mapped_name = _OPENCLAW_SANDBOX_TOOL_ALIASES.get(tool_name.lower())
+            native_sandbox_fallback = (
+                bridge_rec is None
+                and mapped_name is not None
+                and mapped_name in declared_names
+            )
+            if native_sandbox_fallback:
+                # OpenClaw normalises Bash -> exec (and lower-cases core file
+                # tools), so its managed core tool can win the name collision
+                # with the generated bridge plugin. It still executes inside
+                # the same task sandbox. Preserve native ClawEval names and use
+                # the session's real exit/status evidence instead of inventing
+                # a missing-bridge HTTP 500.
+                tool_name = mapped_name
+                is_error = _session_tool_failed(event)
+                last_assistant_msg.message.content[-1].name = tool_name
+            else:
+                is_error = _compute_is_error(event, bridge_rec)
 
             # 3) Emit ToolResultBlock as the next user message (claw-eval
             #    folds toolResult into a user-role message; see
@@ -401,6 +440,19 @@ def translate_openclaw(
                         response_body=bridge_rec.get("response"),
                         latency_ms=_coerce_duration_ms(bridge_rec.get("durationMs"))
                         or duration,
+                    )
+                )
+            elif native_sandbox_fallback:
+                pending_dispatches.append(
+                    ToolDispatch(
+                        trace_id=trace_id,
+                        tool_use_id=call_id,
+                        tool_name=tool_name,
+                        endpoint_url="openclaw://sandbox-core",
+                        request_body=tool_input,
+                        response_status=500 if is_error else 200,
+                        response_body=event.get("output"),
+                        latency_ms=duration,
                     )
                 )
             else:
@@ -463,6 +515,9 @@ def translate_openclaw(
                 harness="openclaw",
             )
         )
+
+        for event in media_events:
+            writer.write_event(MediaLoad(trace_id=trace_id, **event))
 
         for msg in pending_messages:
             writer.write_event(msg)
