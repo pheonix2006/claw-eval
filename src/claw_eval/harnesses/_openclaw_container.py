@@ -44,6 +44,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ._openclaw_media import build_media_agent_command
 from ._openclaw_native import (
     _build_openclaw_temp_config,
     _attest_reasoning_effort,
@@ -136,6 +137,7 @@ def run_in_container(
     agent_id: Optional[str] = None,
     seeded_config_path: Optional[str] = None,
     session_key: Optional[str] = None,
+    images: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Drive an OpenClaw subprocess inside ``container``.
 
@@ -354,13 +356,27 @@ def run_in_container(
         pass
 
     # ---- The actual OpenClaw subprocess. ----
-    oc_cmd = _build_agent_cmd(
-        prompt=prompt,
-        agent_id=resolved_agent_id,
-        timeout_s=timeout_s,
-        session_key=session_key,
-        thinking=thinking,
-        reasoning_effort=reasoning_effort,
+    oc_cmd = (
+        build_media_agent_command(
+            raw_dir=Path(raw_dir_host),
+            openclaw_package_root="/usr/local/lib/node_modules/openclaw",
+            message=prompt,
+            agent_id=resolved_agent_id,
+            images=images,
+            timeout_s=timeout_s,
+            session_key=session_key,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+        )
+        if images
+        else _build_agent_cmd(
+            prompt=prompt,
+            agent_id=resolved_agent_id,
+            timeout_s=timeout_s,
+            session_key=session_key,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+        )
     )
 
     # docker exec needs a slightly bigger timeout than OpenClaw's own

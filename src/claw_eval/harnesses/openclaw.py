@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import _openclaw_bridge, _openclaw_container, _openclaw_native
+from ._openclaw_media import project_prompt_attachments
 from ._openclaw_model_budget import OpenClawModelBudgetProxy
 from ._snapshot import collect_workdir_snapshot, inject_grader_files_host
 from ._trace_adapter import translate_openclaw
@@ -485,6 +486,11 @@ class OpenClawHarness:
         trace_dir = Path(trace_dir)
         trace_dir.mkdir(parents=True, exist_ok=True)
         task_dir = self._task_dir(task)
+        prompt_media = project_prompt_attachments(
+            message=task.prompt.text,
+            attachments=task.prompt.attachments,
+            task_dir=task_dir,
+        )
 
         # Inject the full SANDBOX_TOOLS set (deduped), mirroring the original
         # loop's container-mode behaviour (runner/loop.py:294-302). Without
@@ -568,8 +574,13 @@ class OpenClawHarness:
                 evidence_path=raw_dir / "model_budget.json",
                 provider_transport=cfg.model.provider_transport,
             ) as model_budget:
+                prompt_images_pending = bool(prompt_media.images)
+
                 def run_turn(message: str, session_key: "str | None") -> dict:
+                    nonlocal prompt_images_pending
                     remaining = max(1.0, deadline - time.monotonic())
+                    turn_images = list(prompt_media.images) if prompt_images_pending else []
+                    prompt_images_pending = False
                     return _openclaw_container.run_in_container(
                         prompt=message,
                         container=sandbox_handle.container,
@@ -598,10 +609,11 @@ class OpenClawHarness:
                         extra_plugins=[bridge.plugin_id] if bridge.plugin_id else [],
                         seeded_config_path=str(config_path),
                         session_key=session_key,
+                        images=turn_images,
                     )
 
                 drive = _drive_user_agent_turns(
-                    prompt=task.prompt.text,
+                    prompt=prompt_media.message,
                     run_turn=run_turn,
                     user_agent=user_agent if ua_enabled else None,
                     persona=getattr(ua_cfg, "persona", "") if ua_cfg is not None else "",
@@ -669,6 +681,7 @@ class OpenClawHarness:
                     getattr(getattr(task, "user_agent", None), "max_rounds", 0) or 0
                 ),
                 user_agent_done=bool(drive.get("done")),
+                media_events=list(prompt_media.events),
             )
 
             raw_dir_path = (
@@ -747,6 +760,11 @@ class OpenClawHarness:
         trace_dir = Path(trace_dir)
         trace_dir.mkdir(parents=True, exist_ok=True)
         task_dir = self._task_dir(task)
+        prompt_media = project_prompt_attachments(
+            message=task.prompt.text,
+            attachments=task.prompt.attachments,
+            task_dir=task_dir,
+        )
 
         # ---- 1. Prepare work_dir (agent's view of the world) ----
         work_dir = self._prepare_workdir(
@@ -823,7 +841,7 @@ class OpenClawHarness:
             # ---- 4. OpenClaw subprocess ----
             try:
                 raw = _openclaw_native.run(
-                    prompt=task.prompt.text,
+                    prompt=prompt_media.message,
                     work_dir=str(work_dir),
                     sandbox_dir=str(case_dir),
                     timeout_s=float(task.environment.timeout_seconds),
@@ -846,6 +864,7 @@ class OpenClawHarness:
                         "max_tokens": getattr(cfg.model, "max_tokens", None),
                     },
                     extra_plugins=[bridge.plugin_id] if bridge.plugin_id else [],
+                    images=list(prompt_media.images),
                 )
             finally:
                 if prev_log_env is None:
@@ -873,6 +892,7 @@ class OpenClawHarness:
                 trace_dir=trace_dir,
                 duration_ms=int(raw.get("durationMs") or 0),
                 status=str(raw.get("status") or "ok"),
+                media_events=list(prompt_media.events),
             )
 
             # ---- 7. inject grader files + snapshot (§3.6) ----

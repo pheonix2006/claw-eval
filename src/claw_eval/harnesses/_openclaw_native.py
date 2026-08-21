@@ -8,7 +8,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from ._openclaw_media import (
+    build_media_agent_command,
+    resolve_openclaw_package_root,
+)
 
 Json = Any
 
@@ -1201,6 +1207,7 @@ def run(
     api_provider: Dict[str, Json],
     agent_id: Optional[str] = None,
     extra_plugins: Optional[List[str]] = None,
+    images: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Json]:
     started_at = time.time()
     _ensure_dir(sandbox_dir)
@@ -1296,11 +1303,34 @@ def run(
         if isinstance(api_key, str) and api_key.strip():
             env["OPENAI_API_KEY"] = api_key.strip()
 
-    cmd = ["openclaw", "agent", "--local", "--json", "--message", prompt, "--agent", str(resolved_agent_id)]
-    if reasoning_effort is not None:
-        cmd.extend(["--thinking", reasoning_effort])
-    if isinstance(timeout_s, (int, float)) and timeout_s > 0:
-        cmd.extend(["--timeout", str(int(timeout_s))])
+    cmd = (
+        build_media_agent_command(
+            raw_dir=Path(raw_dir),
+            openclaw_package_root=resolve_openclaw_package_root(env),
+            message=prompt,
+            agent_id=str(resolved_agent_id),
+            images=images,
+            timeout_s=timeout_s,
+            thinking=bool(api_provider.get("thinking")),
+            reasoning_effort=reasoning_effort,
+        )
+        if images
+        else [
+            "openclaw",
+            "agent",
+            "--local",
+            "--json",
+            "--message",
+            prompt,
+            "--agent",
+            str(resolved_agent_id),
+        ]
+    )
+    if not images:
+        if reasoning_effort is not None:
+            cmd.extend(["--thinking", reasoning_effort])
+        if isinstance(timeout_s, (int, float)) and timeout_s > 0:
+            cmd.extend(["--timeout", str(int(timeout_s))])
 
     if isinstance(base_url, str) and base_url.strip() and isinstance(model, str) and model.strip():
         env["OPENCLAW_CONFIG_PATH"] = _build_openclaw_temp_config(
@@ -1362,8 +1392,13 @@ def run(
     used_timeout = timeout_s if isinstance(timeout_s, (int, float)) and timeout_s > 0 else None
     try:
         try:
+            effective_cmd = (
+                cmd
+                if images
+                else ["openclaw", "--no-color", "--log-level", "silent", *cmd[1:]]
+            )
             p = subprocess.run(
-                ["openclaw", "--no-color", "--log-level", "silent", *cmd[1:]],
+                effective_cmd,
                 cwd=os.path.abspath(work_dir),
                 env=env,
                 capture_output=True,

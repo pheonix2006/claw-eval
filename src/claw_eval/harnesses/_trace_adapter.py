@@ -40,12 +40,13 @@ import json
 import logging
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 from ..models.content import TextBlock, ToolResultBlock, ToolUseBlock
 from ..models.message import Message
 from ..models.trace import (
     AuditSnapshot,
+    MediaLoad,
     TokenUsage,
     ToolDispatch,
     TraceEnd,
@@ -233,6 +234,7 @@ def translate_openclaw(
     user_agent_rounds: int = 0,
     user_agent_max_rounds: int = 0,
     user_agent_done: bool = False,
+    media_events: Sequence[dict[str, Any]] = (),
 ) -> Path:
     """Translate an OpenClaw session + bridge log into a claw-eval trace JSONL.
 
@@ -513,6 +515,9 @@ def translate_openclaw(
                 harness="openclaw",
             )
         )
+
+        for event in media_events:
+            writer.write_event(MediaLoad(trace_id=trace_id, **event))
 
         for msg in pending_messages:
             writer.write_event(msg)
