@@ -188,6 +188,62 @@ def _grade_with_optional_params(
     return scores, judge_calls
 
 
+def _grade_run_result(
+    *,
+    args: argparse.Namespace,
+    task_yaml: Path,
+    task,
+    tasks_dir: Path,
+    trace_path: Path,
+    env_snapshot: dict | None,
+    raw_dir: Path | None,
+    rollout_status: str,
+    model_id: str,
+    judge,
+):
+    """Grade a rollout directly or through its immutable replay bundle.
+
+    ``--freeze-rollout-bundle`` is the Phase-C lifecycle seam used by Harbor:
+    the rollout, exact snapshot, authoritative grader inputs, and native
+    OpenClaw artifacts are frozen before the grader is loaded. The score is
+    then computed from that bundle, proving that grading no longer depends on
+    the live sandbox or mutable task directory.
+    """
+
+    from .graders.registry import get_grader
+    from .trace.reader import load_trace
+
+    if getattr(args, "freeze_rollout_bundle", False):
+        if args.harness != "openclaw":
+            raise RuntimeError(
+                "--freeze-rollout-bundle currently requires --harness openclaw"
+            )
+        from .rollout_bundle import grade_native_rollout, write_native_rollout_bundle
+
+        bundle_root = trace_path.with_name(f"{trace_path.stem}_rollout_bundle")
+        manifest = write_native_rollout_bundle(
+            bundle_root=bundle_root,
+            task_yaml=task_yaml,
+            trace_path=trace_path,
+            env_snapshot=env_snapshot or {},
+            raw_dir=raw_dir,
+            harness=args.harness,
+            model=model_id,
+            rollout_status=rollout_status,
+        )
+        grade = grade_native_rollout(manifest, judge=judge)
+        print(f"Rollout bundle: {manifest}")
+        return grade.scores, grade.judge_calls
+
+    _start, messages, dispatches, media_events, _end, audit_data = load_trace(trace_path)
+    grader = get_grader(task.task_id, tasks_dir=tasks_dir, task_dir=task_yaml.parent)
+    return _grade_with_optional_params(
+        grader, messages, dispatches, task,
+        audit_data=audit_data, judge=judge, media_events=media_events,
+        env_snapshot=env_snapshot,
+    )
+
+
 def _make_user_agent(cfg, task):
     """Create a UserAgent instance if the task has user_agent enabled, or None."""
     if not task.user_agent.enabled:
@@ -615,13 +671,19 @@ def cmd_run(args: argparse.Namespace) -> None:
                 trace_paths.append(trace_path)
                 print(f"Trace: {trace_path}")
 
-                # Grade locally
-                start, messages, dispatches, media_events, end, audit_data = load_trace(trace_path)
-                grader = get_grader(task.task_id, tasks_dir=tasks_dir, task_dir=task_yaml.parent)
-                scores, judge_calls = _grade_with_optional_params(
-                    grader, messages, dispatches, task,
-                    audit_data=audit_data, judge=judge, media_events=media_events,
+                # Grade locally, optionally by replaying a frozen native bundle.
+                start, _messages, _dispatches, _media_events, end, _audit_data = load_trace(trace_path)
+                scores, judge_calls = _grade_run_result(
+                    args=args,
+                    task_yaml=task_yaml,
+                    task=task,
+                    tasks_dir=tasks_dir,
+                    trace_path=trace_path,
                     env_snapshot=env_snapshot,
+                    raw_dir=result.raw_dir,
+                    rollout_status=result.status,
+                    model_id=model_id,
+                    judge=judge,
                 )
                 task_score = compute_task_score(scores)
                 passed = is_pass(task_score)
@@ -726,13 +788,19 @@ def cmd_run(args: argparse.Namespace) -> None:
                             "error": f"not found: {local_path}",
                         }
 
-            # Grade
-            start, messages, dispatches, media_events, end, audit_data = load_trace(trace_path)
-            grader = get_grader(task.task_id, tasks_dir=tasks_dir, task_dir=task_yaml.parent)
-            scores, judge_calls = _grade_with_optional_params(
-                grader, messages, dispatches, task,
-                audit_data=audit_data, judge=judge, media_events=media_events,
+            # Grade, optionally by replaying a frozen native bundle.
+            _start, _messages, _dispatches, _media_events, end, _audit_data = load_trace(trace_path)
+            scores, judge_calls = _grade_run_result(
+                args=args,
+                task_yaml=task_yaml,
+                task=task,
+                tasks_dir=tasks_dir,
+                trace_path=trace_path,
                 env_snapshot=env_snapshot,
+                raw_dir=result.raw_dir,
+                rollout_status=result.status,
+                model_id=model_id,
+                judge=judge,
             )
             task_score = compute_task_score(scores)
             passed = is_pass(task_score)
@@ -929,6 +997,32 @@ def cmd_grade(args: argparse.Namespace) -> None:
         for i, c in enumerate(judge_calls):
             print(f"  [{i+1}] {c['method']} score={c['score']:.2f}")
             print(f"       {c['reasoning'][:200]}")
+
+
+def cmd_grade_bundle(args: argparse.Namespace) -> None:
+    """Grade an immutable native rollout bundle."""
+    _apply_proxy(getattr(args, "proxy", None))
+
+    from .config import load_config
+    from .rollout_bundle import grade_native_rollout, load_native_rollout_bundle
+
+    cfg = load_config(args.config if hasattr(args, "config") else None)
+    judge = _make_judge(cfg, args)
+    bundle = load_native_rollout_bundle(Path(args.bundle))
+    grade = grade_native_rollout(bundle.root, judge=judge)
+    scores = grade.scores
+
+    print(f"Bundle:  {bundle.root / 'bundle.json'}")
+    print(f"Task:    {bundle.manifest['task_id']}")
+    print(f"Model:   {bundle.manifest['model']}")
+    print(f"Harness: {bundle.manifest['harness']}")
+    print()
+    print(f"completion:     {scores.completion:.2f}")
+    print(f"robustness:     {scores.robustness:.2f}")
+    print(f"communication:  {scores.communication:.2f}")
+    print(f"safety:         {scores.safety:.1f}")
+    print(f"task_score:     {grade.task_score:.2f}")
+    print(f"passed:         {grade.passed}")
 
 
 def _append_grading_to_trace(
@@ -1938,6 +2032,14 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--sandbox", action="store_true", help="Run inside a Docker sandbox container")
     p_run.add_argument("--sandbox-image", default=None, help="Override sandbox Docker image name")
     p_run.add_argument("--sandbox-tools", action="store_true", help="Inject sandbox tools (shell/file/browser) without Docker")
+    p_run.add_argument(
+        "--freeze-rollout-bundle",
+        action="store_true",
+        help=(
+            "Freeze exact OpenClaw rollout/grader inputs and compute the score "
+            "by replaying that immutable bundle"
+        ),
+    )
     p_run.add_argument("--proxy", default=None, help="HTTP proxy URL for model/judge API traffic (e.g. http://proxy:port)")
     p_run.add_argument(
         "--harness", default="claweval", choices=["claweval", "openclaw", "aorchestra", "codex", "claudecode"],
@@ -1981,6 +2083,18 @@ def main(argv: list[str] | None = None) -> None:
     p_grade.add_argument("--judge-model", default=None, help="Override judge model ID")
     p_grade.add_argument("--no-judge", action="store_true", help="Disable LLM judge for communication scoring")
     p_grade.add_argument("--proxy", default=None, help="HTTP proxy URL for judge API traffic")
+
+    # grade-bundle
+    p_grade_bundle = sub.add_parser(
+        "grade-bundle", help="Grade an immutable native rollout bundle"
+    )
+    p_grade_bundle.add_argument(
+        "--bundle", required=True, help="Path to bundle.json or its directory"
+    )
+    p_grade_bundle.add_argument("--config", default=None, help="Path to config.yaml")
+    p_grade_bundle.add_argument("--judge-model", default=None, help="Override judge model ID")
+    p_grade_bundle.add_argument("--no-judge", action="store_true", help="Disable LLM judge")
+    p_grade_bundle.add_argument("--proxy", default=None, help="HTTP proxy URL for judge API traffic")
 
     # batch
     p_batch = sub.add_parser("batch", help="Run all tasks in parallel")
@@ -2041,6 +2155,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_build_image(args)
     elif args.command == "grade":
         cmd_grade(args)
+    elif args.command == "grade-bundle":
+        cmd_grade_bundle(args)
     elif args.command == "batch":
         cmd_batch(args)
     elif args.command == "cleanup":

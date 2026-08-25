@@ -38,7 +38,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -48,6 +47,7 @@ from ._openclaw_media import build_media_agent_command
 from ._openclaw_native import (
     _build_openclaw_temp_config,
     _attest_reasoning_effort,
+    _copy_session_source,
     _extract_openclaw_trace,
     _find_latest_session,
     _json_first_value,
@@ -97,6 +97,7 @@ def _build_agent_cmd(
     agent_id: str,
     timeout_s: float,
     session_key: Optional[str] = None,
+    session_id: Optional[str] = None,
     thinking: bool = False,
     reasoning_effort: Optional[str] = None,
 ) -> "list[str]":
@@ -113,8 +114,12 @@ def _build_agent_cmd(
         "--message", prompt,
         "--agent", str(agent_id),
     ]
+    if session_key and session_id:
+        raise ValueError("session_key and session_id are mutually exclusive")
     if session_key:
         cmd.extend(["--session-key", str(session_key)])
+    if session_id:
+        cmd.extend(["--session-id", str(session_id)])
     reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     if reasoning_effort is not None:
         cmd.extend(["--thinking", reasoning_effort])
@@ -137,6 +142,7 @@ def run_in_container(
     agent_id: Optional[str] = None,
     seeded_config_path: Optional[str] = None,
     session_key: Optional[str] = None,
+    session_id: Optional[str] = None,
     images: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Drive an OpenClaw subprocess inside ``container``.
@@ -182,6 +188,10 @@ def run_in_container(
         multi-turn user_agent loop relies on to accumulate the conversation
         across independent CLI invocations. ``None`` (default) omits the flag,
         keeping single-turn behaviour byte-identical.
+    session_id:
+        Concrete OpenClaw session id returned by a prior turn. Multi-turn
+        callers use this after the first turn because OpenClaw local mode may
+        rebind a stable session key to a new session id on each CLI process.
     """
     started_at = time.time()
     raw_dir_host = os.path.join(case_dir_host, "raw")
@@ -292,6 +302,7 @@ def run_in_container(
         "OPENCLAW_HOME": case_home,
         "HOME": case_home,
         "OPENCLAW_CONFIG_PATH": config_path_host,
+        "OPENCLAW_TRAJECTORY": "1",
     }
     if provider_api == "anthropic-messages":
         if isinstance(base_url, str) and base_url.strip():
@@ -365,6 +376,7 @@ def run_in_container(
             images=images,
             timeout_s=timeout_s,
             session_key=session_key,
+            session_id=session_id,
             thinking=thinking,
             reasoning_effort=reasoning_effort,
         )
@@ -374,6 +386,7 @@ def run_in_container(
             agent_id=resolved_agent_id,
             timeout_s=timeout_s,
             session_key=session_key,
+            session_id=session_id,
             thinking=thinking,
             reasoning_effort=reasoning_effort,
         )
@@ -459,23 +472,15 @@ def run_in_container(
             state_dir, "agents", str(resolved_agent_id), "sessions", f"{session_id}.jsonl"
         )
         if os.path.exists(candidate) and os.path.isfile(candidate):
-            dst = os.path.join(raw_dir_host, "session.jsonl")
-            try:
-                shutil.copy2(candidate, dst)
-                session_jsonl = dst
-            except Exception:
-                session_jsonl = None
+            session_jsonl = _copy_session_source(
+                src=candidate, dst_dir=raw_dir_host
+            )
     if not session_jsonl:
         sid2, src2 = _find_latest_session(state_dir=state_dir, agent_id=str(resolved_agent_id))
         if sid2 and not session_id:
             session_id = sid2
         if src2:
-            try:
-                dst = os.path.join(raw_dir_host, "session.jsonl")
-                shutil.copy2(src2, dst)
-                session_jsonl = dst
-            except Exception:
-                session_jsonl = None
+            session_jsonl = _copy_session_source(src=src2, dst_dir=raw_dir_host)
 
     outs = _outputs_from_openclaw_result(
         parsed if isinstance(parsed, dict) else {},

@@ -123,6 +123,34 @@ claw-eval batch --config model_configs/claude_opus_46.yaml --sandbox --trials 3 
 # For different tasks, you can follow different config: config_general.yaml/config_multimodal.yaml/config_user_agent.yaml.
 ```
 
+### Frozen OpenClaw rollout bundles
+
+Framework integrations can split rollout execution from grading without
+reimplementing Claw-Eval's task graders:
+
+```bash
+claw-eval run \
+  --task tasks/T001zh_email_triage \
+  --harness openclaw \
+  --sandbox \
+  --freeze-rollout-bundle \
+  --config config_multimodal_smoke.yaml
+```
+
+The opt-in flag freezes the ungraded trace, exact environment snapshot,
+task/grader sources, recursive peer-grader dependencies, and available native
+OpenClaw session artifacts before scoring. The authoritative score is then
+computed by replaying that hash-inventoried bundle. Normal Claw-Eval runs are
+unchanged when the flag is omitted.
+
+The frozen bundle can be graded again without a sandbox or another agent run:
+
+```bash
+claw-eval grade-bundle \
+  --bundle traces/<model>/<task>_rollout_bundle \
+  --config config_multimodal_smoke.yaml
+```
+
 ---
 
 ## Roadmap
@@ -164,4 +192,3 @@ If you use Claw-Eval in your research, please cite:
 ## License
 
 This project is released under the [MIT License](LICENSE).
-

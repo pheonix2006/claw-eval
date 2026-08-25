@@ -68,6 +68,51 @@ def test_extract_openclaw_trace_signature() -> None:
         assert sig.parameters[name].kind == inspect.Parameter.KEYWORD_ONLY
 
 
+def test_copy_session_retains_rich_trajectory_sidecar(tmp_path) -> None:
+    from claw_eval.harnesses import _openclaw_native
+
+    sessions = tmp_path / "state/agents/main/sessions"
+    sessions.mkdir(parents=True)
+    session = sessions / "session-1.jsonl"
+    sidecar = sessions / "session-1.trajectory.jsonl"
+    session.write_text('{"type":"session","id":"session-1"}\n')
+    sidecar.write_text('{"type":"context.compiled"}\n')
+    output = tmp_path / "output"
+    output.mkdir()
+
+    retained = _openclaw_native._copy_session_jsonl(
+        state_dir=str(tmp_path / "state"),
+        agent_id="main",
+        session_id="session-1",
+        dst_dir=str(output),
+    )
+
+    assert retained == str(output / "session.jsonl")
+    assert (output / "session.jsonl").read_bytes() == session.read_bytes()
+    assert (output / "openclaw.trajectory.jsonl").read_bytes() == sidecar.read_bytes()
+
+
+def test_copy_session_allows_legacy_session_without_sidecar(tmp_path) -> None:
+    from claw_eval.harnesses import _openclaw_native
+
+    sessions = tmp_path / "state/agents/main/sessions"
+    sessions.mkdir(parents=True)
+    session = sessions / "session-1.jsonl"
+    session.write_text('{"type":"session","id":"session-1"}\n')
+    output = tmp_path / "output"
+    output.mkdir()
+
+    retained = _openclaw_native._copy_session_jsonl(
+        state_dir=str(tmp_path / "state"),
+        agent_id="main",
+        session_id="session-1",
+        dst_dir=str(output),
+    )
+
+    assert retained == str(output / "session.jsonl")
+    assert not (output / "openclaw.trajectory.jsonl").exists()
+
+
 def test_extract_places_assistant_before_its_tool_call(tmp_path) -> None:
     from claw_eval.harnesses import _openclaw_native
 

@@ -6,8 +6,10 @@ import importlib.util
 import inspect
 import re
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from ..models.content import ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 from ..models.task import TaskDefinition
@@ -15,16 +17,41 @@ from ..models.trace import DimensionScores, MediaLoad, ToolDispatch, TraceMessag
 
 # base.py is at src/claw_eval/graders/base.py → parents[3] is the repo root.
 _DEFAULT_TASKS_DIR = Path(__file__).resolve().parents[3] / "tasks"
+_PEER_GRADER_TASKS_DIR: ContextVar[Path | None] = ContextVar(
+    "peer_grader_tasks_dir", default=None
+)
 
 
-def load_peer_grader(task_id: str, tasks_dir: str | Path = _DEFAULT_TASKS_DIR) -> type:
+@contextmanager
+def peer_grader_tasks_dir(tasks_dir: str | Path) -> Iterator[None]:
+    """Resolve implicit peer graders from one explicit task tree.
+
+    Task-local graders historically call ``load_peer_grader(task_id)`` while
+    they are imported. A frozen rollout replay must not silently fall back to
+    the mutable checkout's task tree, so replay code scopes that implicit
+    lookup to the bundle's frozen peer-grader directory.
+    """
+
+    token = _PEER_GRADER_TASKS_DIR.set(Path(tasks_dir))
+    try:
+        yield
+    finally:
+        _PEER_GRADER_TASKS_DIR.reset(token)
+
+
+def load_peer_grader(task_id: str, tasks_dir: str | Path | None = None) -> type:
     """Load a grader class from another task directory.
 
     Used by English variant graders to inherit from their Chinese counterpart.
 
     Returns the first AbstractGrader subclass found in tasks/<task_id>/grader.py.
     """
-    grader_path = Path(tasks_dir) / task_id / "grader.py"
+    effective_tasks_dir = (
+        Path(tasks_dir)
+        if tasks_dir is not None
+        else (_PEER_GRADER_TASKS_DIR.get() or _DEFAULT_TASKS_DIR)
+    )
+    grader_path = effective_tasks_dir / task_id / "grader.py"
     if not grader_path.exists():
         raise FileNotFoundError(
             f"No grader found at {grader_path} for task_id={task_id!r}"

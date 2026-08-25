@@ -143,6 +143,22 @@ def test_media_sdk_command_matches_native_agent_command_contract(
     assert "agentCommand" in (tmp_path / "openclaw_media_runner.mjs").read_text()
 
 
+def test_media_sdk_command_resumes_concrete_session_id(tmp_path: Path) -> None:
+    build_media_agent_command(
+        raw_dir=tmp_path,
+        openclaw_package_root="/usr/local/lib/node_modules/openclaw",
+        message="continue",
+        agent_id="main",
+        images=[],
+        timeout_s=60,
+        session_id="session-123",
+    )
+
+    payload = json.loads((tmp_path / "openclaw_media_input.json").read_text())
+    assert payload["options"]["sessionId"] == "session-123"
+    assert "sessionKey" not in payload["options"]
+
+
 def test_trace_adapter_emits_media_load_before_messages(tmp_path: Path) -> None:
     task = TaskDefinition(
         task_id="media-task",
