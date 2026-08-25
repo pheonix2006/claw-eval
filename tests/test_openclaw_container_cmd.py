@@ -42,6 +42,30 @@ def test_cmd_threads_session_key_when_given() -> None:
     assert cmd[cmd.index("--agent") + 1] == "main"
 
 
+def test_cmd_resumes_concrete_session_id() -> None:
+    cmd = _build_agent_cmd(
+        prompt="round 2",
+        agent_id="main",
+        timeout_s=600,
+        session_id="session-123",
+    )
+    assert cmd[cmd.index("--session-id") + 1] == "session-123"
+    assert "--session-key" not in cmd
+
+
+def test_cmd_rejects_ambiguous_session_target() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _build_agent_cmd(
+            prompt="round 2",
+            agent_id="main",
+            timeout_s=600,
+            session_key="agent:main:key",
+            session_id="session-123",
+        )
+
+
 def test_cmd_no_timeout_when_nonpositive() -> None:
     cmd = _build_agent_cmd(prompt="x", agent_id="main", timeout_s=0)
     assert "--timeout" not in cmd

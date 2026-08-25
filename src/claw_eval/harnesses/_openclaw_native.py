@@ -126,16 +126,28 @@ def _openclaw_default_agent_id(env: Optional[Dict[str, str]] = None) -> Optional
     return None
 
 
-def _copy_session_jsonl(*, state_dir: str, agent_id: str, session_id: str, dst_dir: str) -> Optional[str]:
-    src = os.path.join(os.path.abspath(state_dir), "agents", agent_id, "sessions", f"{session_id}.jsonl")
+def _copy_session_source(*, src: str, dst_dir: str) -> Optional[str]:
+    """Retain the native session and its optional rich trajectory sidecar."""
+
     if not os.path.exists(src) or not os.path.isfile(src):
         return None
     dst = os.path.join(dst_dir, "session.jsonl")
     try:
         shutil.copy2(src, dst)
+        trajectory_src = str(Path(src).with_suffix(".trajectory.jsonl"))
+        if os.path.isfile(trajectory_src):
+            shutil.copy2(
+                trajectory_src,
+                os.path.join(dst_dir, "openclaw.trajectory.jsonl"),
+            )
         return dst
     except Exception:
         return None
+
+
+def _copy_session_jsonl(*, state_dir: str, agent_id: str, session_id: str, dst_dir: str) -> Optional[str]:
+    src = os.path.join(os.path.abspath(state_dir), "agents", agent_id, "sessions", f"{session_id}.jsonl")
+    return _copy_session_source(src=src, dst_dir=dst_dir)
 
 
 def _safe_json_loads(line: str) -> Optional[Dict[str, Json]]:
@@ -1491,11 +1503,7 @@ def run(
         if sid2 and not session_id:
             session_id = sid2
         if src2:
-            try:
-                shutil.copy2(src2, os.path.join(raw_dir, "session.jsonl"))
-                session_jsonl = os.path.join(raw_dir, "session.jsonl")
-            except Exception:
-                session_jsonl = None
+            session_jsonl = _copy_session_source(src=src2, dst_dir=raw_dir)
 
     outs = _outputs_from_openclaw_result(parsed if isinstance(parsed, dict) else {}, os.path.abspath(work_dir))
     last_text = ""

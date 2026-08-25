@@ -575,13 +575,14 @@ class OpenClawHarness:
                 provider_transport=cfg.model.provider_transport,
             ) as model_budget:
                 prompt_images_pending = bool(prompt_media.images)
+                resume_session_id: str | None = None
 
                 def run_turn(message: str, session_key: "str | None") -> dict:
-                    nonlocal prompt_images_pending
+                    nonlocal prompt_images_pending, resume_session_id
                     remaining = max(1.0, deadline - time.monotonic())
                     turn_images = list(prompt_media.images) if prompt_images_pending else []
                     prompt_images_pending = False
-                    return _openclaw_container.run_in_container(
+                    raw = _openclaw_container.run_in_container(
                         prompt=message,
                         container=sandbox_handle.container,
                         work_dir_host="/workspace",
@@ -608,9 +609,17 @@ class OpenClawHarness:
                         },
                         extra_plugins=[bridge.plugin_id] if bridge.plugin_id else [],
                         seeded_config_path=str(config_path),
-                        session_key=session_key,
+                        session_key=(session_key if resume_session_id is None else None),
+                        session_id=resume_session_id,
                         images=turn_images,
                     )
+                    trace = raw.get("trace") if isinstance(raw, dict) else None
+                    observed_session_id = (
+                        trace.get("sessionId") if isinstance(trace, dict) else None
+                    )
+                    if isinstance(observed_session_id, str) and observed_session_id:
+                        resume_session_id = observed_session_id
+                    return raw
 
                 drive = _drive_user_agent_turns(
                     prompt=prompt_media.message,

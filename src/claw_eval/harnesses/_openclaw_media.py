@@ -207,6 +207,7 @@ def build_media_agent_command(
     images: Sequence[dict[str, str]],
     timeout_s: float,
     session_key: str | None = None,
+    session_id: str | None = None,
     thinking: bool = False,
     reasoning_effort: str | None = None,
 ) -> list[str]:
@@ -227,8 +228,12 @@ def build_media_agent_command(
         "cleanupCliLiveSessionOnRunEnd": True,
         "oneShotCliRun": True,
     }
+    if session_key and session_id:
+        raise ValueError("session_key and session_id are mutually exclusive")
     if session_key:
         options["sessionKey"] = session_key
+    if session_id:
+        options["sessionId"] = session_id
     if reasoning_effort is not None:
         options["thinking"] = reasoning_effort
     elif thinking:
