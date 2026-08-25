@@ -120,6 +120,31 @@ def test_bundle_rejects_member_drift(tmp_path: Path) -> None:
         load_native_rollout_bundle(manifest)
 
 
+@pytest.mark.parametrize("field", ["task_yaml", "trace", "env_snapshot"])
+def test_bundle_rejects_uninventoried_replay_inputs(
+    tmp_path: Path, field: str
+) -> None:
+    task_yaml, trace, snapshot = _fixture(tmp_path)
+    manifest_path = write_native_rollout_bundle(
+        bundle_root=tmp_path / "bundle",
+        task_yaml=task_yaml,
+        trace_path=trace,
+        env_snapshot=snapshot,
+        raw_dir=None,
+        harness="openclaw",
+        model="model",
+        rollout_status="ok",
+    )
+    replacement = manifest_path.parent / "replacement.json"
+    replacement.write_text("{}\n", encoding="utf-8")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest[field] = replacement.name
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RolloutBundleError, match="member inventory"):
+        load_native_rollout_bundle(manifest_path)
+
+
 def test_bundle_retains_native_session_and_rich_sidecar(tmp_path: Path) -> None:
     task_yaml, trace, snapshot = _fixture(tmp_path)
     raw = tmp_path / "raw"

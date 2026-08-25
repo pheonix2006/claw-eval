@@ -337,6 +337,16 @@ def load_native_rollout_bundle(path: Path) -> LoadedRolloutBundle:
     members = manifest.get("members")
     if not isinstance(members, dict):
         raise RolloutBundleError("rollout bundle has no member inventory")
+    for field, label in (
+        ("task_yaml", "task YAML"),
+        ("trace", "trace"),
+        ("env_snapshot", "environment snapshot"),
+    ):
+        relative = manifest.get(field)
+        if not isinstance(relative, str) or relative not in members:
+            raise RolloutBundleError(
+                f"rollout bundle {label} is not covered by the member inventory"
+            )
     root = manifest_path.parent.resolve()
     for relative, contract in members.items():
         if not isinstance(relative, str) or not isinstance(contract, dict):
